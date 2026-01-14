@@ -12,11 +12,16 @@ Proxy-WASM filter for CrowdSec integration with LAPI stream and AppSec support.
 
 ## Build
 
+**Requirements:** TinyGo (for WASM without threading support)
+
 ```bash
+# Install TinyGo
+wget https://github.com/tinygo-org/tinygo/releases/download/v0.33.0/tinygo_0.33.0_amd64.deb
+sudo dpkg -i tinygo_0.33.0_amd64.deb
+
+# Build
 make build
 ```
-
-Requires Go 1.24+ with WASI support.
 
 ## Configuration
 

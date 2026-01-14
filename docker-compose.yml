@@ -1,0 +1,19 @@
+
+services:
+  envoy:
+    image: envoyproxy/envoy:v1.37-latest
+    ports:
+      - "8000:8000"
+      - "9901:9901"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml
+      - ./plugin.wasm:/etc/envoy/plugin.wasm
+    command: /usr/local/bin/envoy -c /etc/envoy/envoy.yaml
+    network_mode: host
+    env_file:
+      - path: .env
+
+  backend:
+    image: nginx:alpine
+    ports:
+      - "8081:80"

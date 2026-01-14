@@ -5,15 +5,18 @@ import (
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm/types"
 )
 
-func main() {
-	proxywasm.SetVMContext(&vmContext{})
+func main() {}
+func init() {
+	proxywasm.SetPluginContext(NewPluginContext)
 }
 
 type vmContext struct {
+	// Embed the default VM context here,
+	// so that we don't need to reimplement all the methods.
 	types.DefaultVMContext
 }
 
-func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
+func NewPluginContext(contextID uint32) types.PluginContext {
 	return &pluginContext{
 		contextID: contextID,
 	}

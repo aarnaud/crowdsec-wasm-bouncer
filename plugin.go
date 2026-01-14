@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"time"
+	"math/rand"
 
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm"
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm/types"
@@ -16,6 +16,7 @@ type pluginContext struct {
 	calloutID uint32
 	firstSync bool
 	decisions map[string]Decision
+	bouncerId int
 }
 
 type Config struct {
@@ -40,6 +41,8 @@ type AppSecConfig struct {
 }
 
 func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
+	ctx.bouncerId = rand.Intn(100000)
+	proxywasm.LogInfof("CrowdSec Bouncer id(%d) is starting...", ctx.bouncerId)
 	data, err := proxywasm.GetPluginConfiguration()
 	if err != nil {
 		proxywasm.LogCriticalf("failed to get config: %v", err)
@@ -68,8 +71,8 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	ctx.syncDecisions()
 
 	// Schedule periodic sync
-	syncDuration := time.Duration(config.CrowdSec.LAPI.SyncFreq) * time.Second
-	if err := proxywasm.SetTickPeriodMilliSeconds(uint32(syncDuration.Milliseconds())); err != nil {
+	syncMillis := uint32(config.CrowdSec.LAPI.SyncFreq * 1000) // Convert seconds to milliseconds
+	if err := proxywasm.SetTickPeriodMilliSeconds(syncMillis); err != nil {
 		proxywasm.LogErrorf("failed to set tick period: %v", err)
 	}
 
@@ -82,8 +85,7 @@ func (ctx *pluginContext) OnTick() {
 
 func (ctx *pluginContext) syncDecisions() {
 	// Use plugin context ID as unique bouncer identifier
-	contextID := ctx.contextID
-	bouncerID := fmt.Sprintf("wasm-ctx-%d", contextID)
+	bouncerID := fmt.Sprintf("wasm-ctx-%d", ctx.bouncerId)
 
 	// Only use startup=true on first sync
 	path := "/v1/decisions/stream"
@@ -95,8 +97,8 @@ func (ctx *pluginContext) syncDecisions() {
 	headers := [][2]string{
 		{":method", "GET"},
 		{":path", path},
-		{":authority", ctx.config.CrowdSec.LAPI.URL},
-		{"x-api-key", ctx.config.CrowdSec.LAPI.Key},
+		{":authority", ""},
+		{"X-Api-Key", ctx.config.CrowdSec.LAPI.Key},
 		{"user-agent", fmt.Sprintf("crowdsec-wasm-bouncer/%s", bouncerID)},
 	}
 
@@ -105,7 +107,7 @@ func (ctx *pluginContext) syncDecisions() {
 		headers,
 		nil,
 		nil,
-		5000,
+		60000,
 		ctx.onLAPIResponse,
 	)
 

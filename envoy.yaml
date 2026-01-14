@@ -23,36 +23,37 @@ static_resources:
                 route:
                   cluster: backend_service
           http_filters:
-          - name: envoy.filters.http.wasm
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
-              config:
-                name: "crowdsec_bouncer"
-                vm_config:
-                  runtime: "envoy.wasm.runtime.v8"
-                  code:
-                    local:
-                      filename: "./main.wasm"
-                configuration:
-                  "@type": "type.googleapis.com/google.protobuf.StringValue"
-                  value: |
-                    {
-                      "crowdsec": {
-                        "lapi": {
-                          "url": "localhost:8080",
-                          "key": "your-lapi-key",
-                          "sync_freq": 30
-                        },
-                        "appsec": {
-                          "enabled": true,
-                          "url": "localhost:7422",
-                          "key": "your-appsec-key"
+            - name: envoy.filters.http.wasm
+              typed_config:
+                "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+                type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                value:
+                  config:
+                    vm_config:
+                      runtime: "envoy.wasm.runtime.v8"
+                      code:
+                        local:
+                          filename: "/etc/envoy/plugin.wasm"
+                    configuration:
+                      "@type": "type.googleapis.com/google.protobuf.StringValue"
+                      value: |
+                        {
+                          "crowdsec": {
+                            "lapi": {
+                              "url": "127.0.0.1:8080",
+                              "key": "CROWDSEC_LAPI_KEY",
+                              "sync_freq": 30
+                            },
+                            "appsec": {
+                              "enabled": true,
+                              "url": "127.0.0.1:7422",
+                              "key": "CROWDSEC_APPSEC_KEY"
+                            }
+                          }
                         }
-                      }
-                    }
-          - name: envoy.filters.http.router
-            typed_config:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+            - name: envoy.filters.http.router
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
 
   clusters:
   - name: backend_service

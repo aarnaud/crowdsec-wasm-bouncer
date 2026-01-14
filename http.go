@@ -1,9 +1,8 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"time"
+	"strconv"
 
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm"
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm/types"
@@ -24,7 +23,7 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	}
 
 	// Check decision in plugin's in-memory map
-	key := fmt.Sprintf("ip:%s", ip)
+	key := fmt.Sprintf("Ip:%s", ip)
 	if decision, found := ctx.plugin.decisions[key]; found {
 		proxywasm.LogWarnf("Blocking IP %s: %s", ip, decision.Scenario)
 
@@ -37,35 +36,41 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		return types.ActionPause
 	}
 
-	// Send AppSec event async
+	// Send AppSec event async (non-blocking via DispatchHttpCall)
 	if ctx.config.CrowdSec.AppSec.Enabled {
-		go ctx.sendAppSecEvent(ip)
+		ctx.sendAppSecEvent(ip)
 	}
 
 	return types.ActionContinue
 }
 
 func (ctx *httpContext) sendAppSecEvent(ip string) {
+	var err error
 	path, _ := proxywasm.GetHttpRequestHeader(":path")
 	method, _ := proxywasm.GetHttpRequestHeader(":method")
+	host, _ := proxywasm.GetHttpRequestHeader(":host")
+	user_agent, _ := proxywasm.GetHttpRequestHeader(":user-agent")
 
-	event := AppSecEvent{
-		Timestamp: time.Now().Format(time.RFC3339),
-		IP:        ip,
-		URI:       path,
-		Method:    method,
-	}
-
-	body, err := json.Marshal(event)
-	if err != nil {
-		return
+	body := []byte{}
+	if method == "POST" || method == "PUT" || method == "PATCH" {
+		content_lenght, _ := proxywasm.GetHttpRequestHeader(":content-length")
+		bodySize, _ := strconv.Atoi(content_lenght)
+		if bodySize > 100000 {
+			bodySize = 100000
+		}
+		body, _ = proxywasm.GetHttpRequestBody(0, bodySize)
 	}
 
 	headers := [][2]string{
 		{":method", "POST"},
 		{":path", "/v1/appsec/event"},
-		{":authority", ctx.config.CrowdSec.AppSec.URL},
-		{"x-api-key", ctx.config.CrowdSec.AppSec.Key},
+		{":authority", ""},
+		{"X-Crowdsec-Appsec-Ip", ip},
+		{"X-Crowdsec-Appsec-Uri", path},
+		{"X-Crowdsec-Appsec-Host", host},
+		{"X-Crowdsec-Appsec-Verb", method},
+		{"X-Crowdsec-Appsec-User-Agent", user_agent},
+		{"X-Crowdsec-Appsec-Api-Key", ctx.config.CrowdSec.AppSec.Key},
 		{"content-type", "application/json"},
 	}
 
