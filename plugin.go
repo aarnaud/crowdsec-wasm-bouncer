@@ -11,6 +11,7 @@ import (
 
 type pluginContext struct {
 	types.DefaultPluginContext
+	contextID uint32
 	config    *Config
 	calloutID uint32
 	firstSync bool
@@ -80,8 +81,9 @@ func (ctx *pluginContext) OnTick() {
 }
 
 func (ctx *pluginContext) syncDecisions() {
-	// Use plugin context ID as bouncer identifier
-	bouncerID := fmt.Sprintf("wasm-plugin-%d", time.Now().Unix())
+	// Use plugin context ID as unique bouncer identifier
+	contextID := ctx.contextID
+	bouncerID := fmt.Sprintf("wasm-ctx-%d", contextID)
 
 	// Only use startup=true on first sync
 	path := "/v1/decisions/stream"

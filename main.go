@@ -14,5 +14,7 @@ type vmContext struct {
 }
 
 func (*vmContext) NewPluginContext(contextID uint32) types.PluginContext {
-	return &pluginContext{}
+	return &pluginContext{
+		contextID: contextID,
+	}
 }
