@@ -89,10 +89,3 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 		proxywasm.LogWarnf("failed to send AppSec event: %v", err)
 	}
 }
-
-type AppSecEvent struct {
-	Timestamp string `json:"timestamp"`
-	IP        string `json:"ip"`
-	URI       string `json:"uri"`
-	Method    string `json:"method"`
-}
