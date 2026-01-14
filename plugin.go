@@ -57,7 +57,7 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 
 	// Set defaults
 	if config.CrowdSec.LAPI.SyncFreq == 0 {
-		config.CrowdSec.LAPI.SyncFreq = 30
+		config.CrowdSec.LAPI.SyncFreq = 10
 	}
 
 	ctx.config = &config
@@ -161,7 +161,7 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 	// Update shared data
 	for _, d := range resp.New {
 		key := fmt.Sprintf("%s:%s", d.Scope, d.Value)
-		proxywasm.SetSharedData(key, []byte(d.Scenario), 0)
+		proxywasm.SetSharedData(key, []byte(fmt.Sprintf("%s_%s", d.Type, d.Scenario)), 0)
 	}
 
 	for _, d := range resp.Deleted {

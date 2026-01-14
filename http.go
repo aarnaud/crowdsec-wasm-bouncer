@@ -22,10 +22,10 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		ip = string(ipBytes)
 	}
 
-	// Check decision in plugin's in-memory map
+	// Check decision in SharedData - use lowercase "ip" to match CrowdSec scope
 	key := fmt.Sprintf("Ip:%s", ip)
-	if decision, _, err := proxywasm.GetSharedData(key); err != nil {
-		proxywasm.LogWarnf("Blocking IP %s: %s", ip, decision)
+	if decision, _, err := proxywasm.GetSharedData(key); err == nil && len(decision) > 0 {
+		proxywasm.LogWarnf("Blocking IP %s: %s", ip, string(decision))
 
 		if err := proxywasm.SendHttpResponse(403, [][2]string{
 			{"content-type", "text/plain"},
