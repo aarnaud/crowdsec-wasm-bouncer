@@ -15,7 +15,7 @@ type pluginContext struct {
 	config    *Config
 	calloutID uint32
 	firstSync bool
-	decisions map[string]Decision
+	//decisions map[string]Decision
 	bouncerId int
 }
 
@@ -62,13 +62,13 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 
 	ctx.config = &config
 	ctx.firstSync = true
-	ctx.decisions = make(map[string]Decision)
+	//ctx.decisions = make(map[string]Decision)
 
 	proxywasm.LogInfof("CrowdSec Bouncer started - LAPI: %s, AppSec: %v",
 		config.CrowdSec.LAPI.URL, config.CrowdSec.AppSec.Enabled)
 
 	// Initial sync
-	ctx.syncDecisions()
+	ctx.syncDecisions(true)
 
 	// Schedule periodic sync
 	syncMillis := uint32(config.CrowdSec.LAPI.SyncFreq * 1000) // Convert seconds to milliseconds
@@ -80,18 +80,17 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 }
 
 func (ctx *pluginContext) OnTick() {
-	ctx.syncDecisions()
+	ctx.syncDecisions(false)
 }
 
-func (ctx *pluginContext) syncDecisions() {
+func (ctx *pluginContext) syncDecisions(startup bool) {
 	// Use plugin context ID as unique bouncer identifier
 	bouncerID := fmt.Sprintf("wasm-ctx-%d", ctx.bouncerId)
 
 	// Only use startup=true on first sync
 	path := "/v1/decisions/stream"
-	if ctx.firstSync {
+	if startup {
 		path += "?startup=true"
-		ctx.firstSync = false
 	}
 
 	headers := [][2]string{
@@ -135,16 +134,18 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 	// Update in-memory map
 	for _, d := range resp.New {
 		key := fmt.Sprintf("%s:%s", d.Scope, d.Value)
-		ctx.decisions[key] = d
+		//ctx.decisions[key] = d
+		proxywasm.SetSharedData(key, []byte(d.Scenario), 0)
 	}
 
 	for _, d := range resp.Deleted {
 		key := fmt.Sprintf("%s:%s", d.Scope, d.Value)
-		delete(ctx.decisions, key)
+		//delete(ctx.decisions, key)
+		proxywasm.SetSharedData(key, nil, 0)
 	}
 
-	proxywasm.LogInfof("Synced decisions: +%d new, -%d deleted, total: %d",
-		len(resp.New), len(resp.Deleted), len(ctx.decisions))
+	proxywasm.LogInfof("Synced decisions: +%d new, -%d deleted",
+		len(resp.New), len(resp.Deleted))
 }
 
 func (ctx *pluginContext) NewHttpContext(contextID uint32) types.HttpContext {

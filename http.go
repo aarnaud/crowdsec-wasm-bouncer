@@ -24,8 +24,8 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 
 	// Check decision in plugin's in-memory map
 	key := fmt.Sprintf("Ip:%s", ip)
-	if decision, found := ctx.plugin.decisions[key]; found {
-		proxywasm.LogWarnf("Blocking IP %s: %s", ip, decision.Scenario)
+	if decision, _, err := proxywasm.GetSharedData(key); err != nil {
+		proxywasm.LogWarnf("Blocking IP %s: %s", ip, decision)
 
 		if err := proxywasm.SendHttpResponse(403, [][2]string{
 			{"content-type", "text/plain"},
