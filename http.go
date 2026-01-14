@@ -13,6 +13,7 @@ type httpContext struct {
 	types.DefaultHttpContext
 	contextID uint32
 	config    *Config
+	plugin    *pluginContext
 }
 
 func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) types.Action {
@@ -22,23 +23,18 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		ip = string(ipBytes)
 	}
 
-	// Check decision
-	key := fmt.Sprintf("decision:ip:%s", ip)
-	data, _, err := proxywasm.GetSharedData(key)
+	// Check decision in plugin's in-memory map
+	key := fmt.Sprintf("ip:%s", ip)
+	if decision, found := ctx.plugin.decisions[key]; found {
+		proxywasm.LogWarnf("Blocking IP %s: %s", ip, decision.Scenario)
 
-	if err == nil && len(data) > 0 {
-		var decision Decision
-		if err := json.Unmarshal(data, &decision); err == nil {
-			proxywasm.LogWarnf("Blocking IP %s: %s", ip, decision.Scenario)
-
-			if err := proxywasm.SendHttpResponse(403, [][2]string{
-				{"content-type", "text/plain"},
-			}, []byte("Access Denied"), -1); err != nil {
-				proxywasm.LogErrorf("failed to send response: %v", err)
-			}
-
-			return types.ActionPause
+		if err := proxywasm.SendHttpResponse(403, [][2]string{
+			{"content-type", "text/plain"},
+		}, []byte("Access Denied"), -1); err != nil {
+			proxywasm.LogErrorf("failed to send response: %v", err)
 		}
+
+		return types.ActionPause
 	}
 
 	// Send AppSec event async

@@ -14,6 +14,7 @@ type pluginContext struct {
 	config    *Config
 	calloutID uint32
 	firstSync bool
+	decisions map[string]Decision
 }
 
 type Config struct {
@@ -57,6 +58,7 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 
 	ctx.config = &config
 	ctx.firstSync = true
+	ctx.decisions = make(map[string]Decision)
 
 	proxywasm.LogInfof("CrowdSec Bouncer started - LAPI: %s, AppSec: %v",
 		config.CrowdSec.LAPI.URL, config.CrowdSec.AppSec.Enabled)
@@ -126,28 +128,26 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 		return
 	}
 
-	// Store decisions in shared data
+	// Update in-memory map
 	for _, d := range resp.New {
-		key := fmt.Sprintf("decision:%s:%s", d.Scope, d.Value)
-		data, _ := json.Marshal(d)
-		if err := proxywasm.SetSharedData(key, data, 0); err != nil {
-			proxywasm.LogErrorf("failed to store decision: %v", err)
-		}
+		key := fmt.Sprintf("%s:%s", d.Scope, d.Value)
+		ctx.decisions[key] = d
 	}
 
 	for _, d := range resp.Deleted {
-		key := fmt.Sprintf("decision:%s:%s", d.Scope, d.Value)
-		// Shared data removal - ignore errors if key doesn't exist
-		_ = proxywasm.SetSharedData(key, nil, 0)
+		key := fmt.Sprintf("%s:%s", d.Scope, d.Value)
+		delete(ctx.decisions, key)
 	}
 
-	proxywasm.LogInfof("Synced decisions: +%d new, -%d deleted", len(resp.New), len(resp.Deleted))
+	proxywasm.LogInfof("Synced decisions: +%d new, -%d deleted, total: %d",
+		len(resp.New), len(resp.Deleted), len(ctx.decisions))
 }
 
 func (ctx *pluginContext) NewHttpContext(contextID uint32) types.HttpContext {
 	return &httpContext{
 		contextID: contextID,
 		config:    ctx.config,
+		plugin:    ctx,
 	}
 }
 
