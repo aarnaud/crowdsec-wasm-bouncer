@@ -13,6 +13,7 @@ type pluginContext struct {
 	types.DefaultPluginContext
 	config    *Config
 	calloutID uint32
+	firstSync bool
 }
 
 type Config struct {
@@ -55,6 +56,7 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	}
 
 	ctx.config = &config
+	ctx.firstSync = true
 
 	proxywasm.LogInfof("CrowdSec Bouncer started - LAPI: %s, AppSec: %v",
 		config.CrowdSec.LAPI.URL, config.CrowdSec.AppSec.Enabled)
@@ -79,9 +81,16 @@ func (ctx *pluginContext) syncDecisions() {
 	// Use plugin context ID as bouncer identifier
 	bouncerID := fmt.Sprintf("wasm-plugin-%d", time.Now().Unix())
 
+	// Only use startup=true on first sync
+	path := "/v1/decisions/stream"
+	if ctx.firstSync {
+		path += "?startup=true"
+		ctx.firstSync = false
+	}
+
 	headers := [][2]string{
 		{":method", "GET"},
-		{":path", "/v1/decisions/stream?startup=true"},
+		{":path", path},
 		{":authority", ctx.config.CrowdSec.LAPI.URL},
 		{"x-api-key", ctx.config.CrowdSec.LAPI.Key},
 		{"user-agent", fmt.Sprintf("crowdsec-wasm-bouncer/%s", bouncerID)},
