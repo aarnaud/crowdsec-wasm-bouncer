@@ -29,14 +29,16 @@ type CrowdSecConfig struct {
 }
 
 type LAPIConfig struct {
-	URL      string `json:"url"`
+	Cluster  string `json:"cluster"`
+	Host     string `json:"host"`
 	Key      string `json:"key"`
 	SyncFreq int    `json:"sync_freq"` // seconds, default 30
 }
 
 type AppSecConfig struct {
 	Enabled bool   `json:"enabled"`
-	URL     string `json:"url"`
+	Cluster string `json:"cluster"`
+	Host    string `json:"host"`
 	Key     string `json:"key"`
 }
 
@@ -63,8 +65,8 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	ctx.config = &config
 	ctx.firstSync = true
 
-	proxywasm.LogInfof("CrowdSec Bouncer started - LAPI: %s, AppSec: %v",
-		config.CrowdSec.LAPI.URL, config.CrowdSec.AppSec.Enabled)
+	proxywasm.LogInfof("CrowdSec Bouncer started - LAPI cluster: %s, AppSec cluster: %v",
+		config.CrowdSec.LAPI.Cluster, config.CrowdSec.AppSec.Enabled)
 
 	// DON'T sync during OnPluginStart - let first OnTick handle it
 	// This avoids race conditions when multiple workers start simultaneously
@@ -116,13 +118,13 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 	headers := [][2]string{
 		{":method", "GET"},
 		{":path", path},
-		{":authority", ""},
+		{":authority", ctx.config.CrowdSec.LAPI.Host},
 		{"X-Api-Key", ctx.config.CrowdSec.LAPI.Key},
 		{"user-agent", fmt.Sprintf("crowdsec-wasm-bouncer/%s", bouncerID)},
 	}
 
 	calloutID, err := proxywasm.DispatchHttpCall(
-		"crowdsec_lapi",
+		ctx.config.CrowdSec.LAPI.Cluster,
 		headers,
 		nil,
 		nil,

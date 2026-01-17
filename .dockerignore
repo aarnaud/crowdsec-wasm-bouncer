@@ -1,0 +1,26 @@
+# Ignore build artifacts
+plugin.wasm
+*.wasm
+
+# Ignore git
+.git
+.gitignore
+
+# Ignore IDE
+.idea
+.vscode
+
+# Ignore Docker files
+Dockerfile
+docker-compose.yml
+
+# Ignore documentation
+README*.md
+*.md
+
+# Ignore test files
+test.sh
+envoy.yaml
+
+# Ignore install scripts
+install-tinygo.sh
