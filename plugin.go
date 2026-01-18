@@ -33,9 +33,10 @@ type LAPIConfig struct {
 }
 
 type AppSecConfig struct {
-	Enabled bool   `json:"enabled"`
-	Cluster string `json:"cluster"`
-	Key     string `json:"key"`
+	Enabled   bool   `json:"enabled"`
+	AsyncMode bool   `json:"async_mode"`
+	Cluster   string `json:"cluster"`
+	Key       string `json:"key"`
 }
 
 func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {

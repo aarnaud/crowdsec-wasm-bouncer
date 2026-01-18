@@ -39,6 +39,10 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	// Send AppSec event async (non-blocking via DispatchHttpCall)
 	if ctx.config.CrowdSec.AppSec.Enabled {
 		ctx.sendAppSecEvent(ip)
+		// Not AsyncMode
+		if !ctx.config.CrowdSec.AppSec.AsyncMode {
+			return types.ActionPause
+		}
 	}
 
 	return types.ActionContinue
@@ -81,6 +85,32 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 		2000,
 		func(numHeaders, bodySize, numTrailers int) {
 			// Async callback, ignore response
+			if ctx.config.CrowdSec.AppSec.AsyncMode {
+				return
+			}
+
+			status := 500
+			respheaders, err := proxywasm.GetHttpCallResponseHeaders()
+			if err != nil {
+				proxywasm.LogErrorf("failed to get Appsecc response headers: %v", err)
+				return
+			}
+			for _, header := range respheaders {
+				if header[0] == ":status" {
+					status, _ = strconv.Atoi(header[1])
+				}
+			}
+
+			if status == 200 {
+				proxywasm.ResumeHttpRequest()
+				return
+			}
+			proxywasm.LogWarnf("Appsec is blocking request from %s", ip)
+			if err := proxywasm.SendHttpResponse(403, [][2]string{
+				{"content-type", "text/plain"},
+			}, []byte("AppSec, Access Denied"), -1); err != nil {
+				proxywasm.LogErrorf("failed to send response: %v", err)
+			}
 		},
 	)
 
