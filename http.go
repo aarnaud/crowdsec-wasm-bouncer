@@ -51,12 +51,6 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 	host, _ := proxywasm.GetHttpRequestHeader(":host")
 	user_agent, _ := proxywasm.GetHttpRequestHeader(":user-agent")
 
-	// ignore it's own call
-	if host == ctx.config.CrowdSec.AppSec.Host {
-		proxywasm.LogWarnf("Loop detected, ensure the crowdsec appsec route isnt part of wasm extension")
-		return
-	}
-
 	body := []byte{}
 	if method == "POST" || method == "PUT" || method == "PATCH" {
 		content_lenght, _ := proxywasm.GetHttpRequestHeader(":content-length")
@@ -70,7 +64,7 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 	headers := [][2]string{
 		{":method", "POST"},
 		{":path", "/"},
-		{":authority", ctx.config.CrowdSec.AppSec.Host},
+		{":authority", ""},
 		{"X-Crowdsec-Appsec-Ip", ip},
 		{"X-Crowdsec-Appsec-Uri", path},
 		{"X-Crowdsec-Appsec-Host", host},

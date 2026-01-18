@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math/rand"
 
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm"
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm/types"
@@ -16,7 +15,6 @@ type pluginContext struct {
 	calloutID uint32
 	firstSync bool
 	//decisions map[string]Decision
-	bouncerId int
 }
 
 type Config struct {
@@ -30,7 +28,6 @@ type CrowdSecConfig struct {
 
 type LAPIConfig struct {
 	Cluster  string `json:"cluster"`
-	Host     string `json:"host"`
 	Key      string `json:"key"`
 	SyncFreq int    `json:"sync_freq"` // seconds, default 30
 }
@@ -38,13 +35,11 @@ type LAPIConfig struct {
 type AppSecConfig struct {
 	Enabled bool   `json:"enabled"`
 	Cluster string `json:"cluster"`
-	Host    string `json:"host"`
 	Key     string `json:"key"`
 }
 
 func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
-	ctx.bouncerId = rand.Intn(100000)
-	proxywasm.LogInfof("CrowdSec Bouncer id(%d) is starting...", ctx.bouncerId)
+	proxywasm.LogInfof("CrowdSec Bouncer context(%d) is starting...", ctx.contextID)
 	data, err := proxywasm.GetPluginConfiguration()
 	if err != nil {
 		proxywasm.LogCriticalf("failed to get config: %v", err)
@@ -65,14 +60,14 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	ctx.config = &config
 	ctx.firstSync = true
 
-	proxywasm.LogInfof("CrowdSec Bouncer started - LAPI cluster: %s, AppSec cluster: %v",
-		config.CrowdSec.LAPI.Cluster, config.CrowdSec.AppSec.Enabled)
+	proxywasm.LogInfof("CrowdSec Plugin started - LAPI cluster: %s, AppSec cluster: %s, Appsec enabled: %s",
+		ctx.config.CrowdSec.LAPI.Cluster, ctx.config.CrowdSec.AppSec.Cluster, ctx.config.CrowdSec.AppSec.Enabled)
 
 	// DON'T sync during OnPluginStart - let first OnTick handle it
 	// This avoids race conditions when multiple workers start simultaneously
 
 	// Schedule periodic sync
-	syncMillis := uint32(config.CrowdSec.LAPI.SyncFreq * 1000) // Convert seconds to milliseconds
+	syncMillis := uint32(ctx.config.CrowdSec.LAPI.SyncFreq * 1000) // Convert seconds to milliseconds
 	if err := proxywasm.SetTickPeriodMilliSeconds(syncMillis); err != nil {
 		proxywasm.LogErrorf("failed to set tick period: %v", err)
 	}
@@ -90,24 +85,24 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 	// Use SharedData CAS to prevent multiple threads syncing simultaneously
 	syncLockKey := "crowdsec_sync_lock"
 
-	// Try to get existing lock
-	_, cas, err := proxywasm.GetSharedData(syncLockKey)
-	if err == nil {
-		// Lock exists, another thread is syncing
-		proxywasm.LogDebugf("Sync already in progress (bouncer %d), skipping", ctx.bouncerId)
+	// Try to acquire lock atomically
+	lockData, cas, err := proxywasm.GetSharedData(syncLockKey)
+
+	// If lock exists and has data, another thread is syncing
+	if err == nil && len(lockData) > 0 {
+		proxywasm.LogDebugf("Sync already in progress (context %d), skipping", ctx.contextID)
 		return
 	}
 
-	// Try to set lock with CAS (cas should be 0 if key doesn't exist)
+	// Try to set lock with CAS - only one thread will succeed
 	err = proxywasm.SetSharedData(syncLockKey, []byte("locked"), cas)
 	if err != nil {
-		// Another thread acquired the lock first
-		proxywasm.LogDebugf("Failed to acquire sync lock (bouncer %d), skipping", ctx.bouncerId)
+		// Another thread acquired the lock first (CAS failed)
+		proxywasm.LogDebugf("Failed to acquire sync lock (context %d), another thread won", ctx.contextID)
 		return
 	}
 
-	// Use plugin context ID as unique bouncer identifier
-	bouncerID := fmt.Sprintf("wasm-ctx-%d", ctx.bouncerId)
+	proxywasm.LogInfof("Context %d acquired sync lock, starting sync (startup=%v)", ctx.contextID, startup)
 
 	// Only use startup=true on first sync
 	path := "/v1/decisions/stream"
@@ -118,9 +113,9 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 	headers := [][2]string{
 		{":method", "GET"},
 		{":path", path},
-		{":authority", ctx.config.CrowdSec.LAPI.Host},
+		{":authority", ""},
 		{"X-Api-Key", ctx.config.CrowdSec.LAPI.Key},
-		{"user-agent", fmt.Sprintf("crowdsec-wasm-bouncer/%s", bouncerID)},
+		{"user-agent", fmt.Sprintf("crowdsec-wasm-bouncer/ctx-%d", ctx.contextID)},
 	}
 
 	calloutID, err := proxywasm.DispatchHttpCall(
@@ -145,7 +140,11 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) {
 	// Always release the sync lock when done
 	defer func() {
-		proxywasm.SetSharedData("crowdsec_sync_lock", nil, 0)
+		if err := proxywasm.SetSharedData("crowdsec_sync_lock", nil, 0); err != nil {
+			proxywasm.LogErrorf("Failed to release sync lock: %v", err)
+		} else {
+			proxywasm.LogInfof("Context %d released sync lock", ctx.contextID)
+		}
 	}()
 
 	body, err := proxywasm.GetHttpCallResponseBody(0, bodySize)
@@ -171,8 +170,8 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 		proxywasm.SetSharedData(key, nil, 0)
 	}
 
-	proxywasm.LogInfof("Synced decisions: +%d new, -%d deleted",
-		len(resp.New), len(resp.Deleted))
+	proxywasm.LogInfof("Context %d synced decisions: +%d new, -%d deleted",
+		ctx.contextID, len(resp.New), len(resp.Deleted))
 }
 
 func (ctx *pluginContext) NewHttpContext(contextID uint32) types.HttpContext {
