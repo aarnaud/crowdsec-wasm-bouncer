@@ -29,7 +29,7 @@ type CrowdSecConfig struct {
 type LAPIConfig struct {
 	Cluster  string `json:"cluster"`
 	Key      string `json:"key"`
-	SyncFreq int    `json:"sync_freq"` // seconds, default 30
+	SyncFreq int    `json:"sync_freq"` // seconds, default 10
 }
 
 type AppSecConfig struct {

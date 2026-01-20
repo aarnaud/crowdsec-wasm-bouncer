@@ -4,20 +4,14 @@ Proxy-WASM filter for CrowdSec integration with LAPI stream and AppSec support.
 
 ## Features
 
-- **LAPI Stream**: Periodic decision sync every 30s (configurable)
-- **Per-context bouncer ID**: Each WASM context gets unique bouncer ID
+- **LAPI Stream**: Periodic decision sync every 10s (configurable)
 - **Shared memory**: Decisions stored in proxy shared data (accessible across workers)
-- **AppSec**: Async event reporting (non-blocking)
+- **AppSec**: Async event reporting (non-blocking or blocking) (configurable)
 - **IP blocking**: Checks decisions on each request
 
 ## Build
 
-**Requirements:** TinyGo (for WASM without threading support)
-
-```bash
-# Install TinyGo
-wget https://github.com/tinygo-org/tinygo/releases/download/v0.33.0/tinygo_0.33.0_amd64.deb
-sudo dpkg -i tinygo_0.33.0_amd64.deb
+**Requirements:** Go 1.24 (for WASM)
 
 # Build
 make build
@@ -31,13 +25,14 @@ Edit `config.json` or inline in `envoy.yaml`:
 {
   "crowdsec": {
     "lapi": {
-      "url": "localhost:8080",
+      "cluster": "crowdsec_lapi",
       "key": "your-lapi-key",
       "sync_freq": 30
     },
     "appsec": {
       "enabled": true,
-      "url": "localhost:7422",
+      "async_mode": false,
+      "cluster": "crowdsec_appsec",
       "key": "your-appsec-key"
     }
   }
@@ -67,12 +62,13 @@ spec:
   pluginConfig:
     crowdsec:
       lapi:
-        url: "crowdsec-lapi:8080"
+        cluster: "crowdsec_lapi"
         key: "your-key"
         sync_freq: 30
       appsec:
         enabled: true
-        url: "crowdsec-appsec:7422"
+        async_mode: false
+        cluster: "crowdsec_appsec"
         key: "your-appsec-key"
 ```
 
@@ -80,5 +76,5 @@ spec:
 
 - **Plugin context**: Syncs decisions periodically via DispatchHttpCall
 - **HTTP context**: Checks IP against shared data on each request
-- **AppSec**: Async dispatch (won't block request flow)
+- **AppSec**: Async dispatch (won't block request flow) or sync (will block request flow)
 - **Thread-safe**: Uses proxy shared data with CAS operations
