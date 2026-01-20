@@ -13,8 +13,10 @@ Proxy-WASM filter for CrowdSec integration with LAPI stream and AppSec support.
 
 **Requirements:** Go 1.24 (for WASM)
 
-# Build
+```
 make build
+# or
+make docker-build
 ```
 
 ## Configuration
