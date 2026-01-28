@@ -52,8 +52,18 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 	var err error
 	path, _ := proxywasm.GetHttpRequestHeader(":path")
 	method, _ := proxywasm.GetHttpRequestHeader(":method")
-	host, _ := proxywasm.GetHttpRequestHeader(":host")
 	user_agent, _ := proxywasm.GetHttpRequestHeader(":user-agent")
+
+	host, err := proxywasm.GetHttpRequestHeader(":authority")
+	if err != nil {
+		proxywasm.LogDebugf("Failed to get request :authority value: %v", err)
+		propHostRaw, propHostErr := proxywasm.GetProperty([]string{"request", "host"})
+		if propHostErr != nil {
+			proxywasm.LogWarnf("Failed to get request :authority value and request host value: %v", propHostErr)
+		} else {
+			host = string(propHostRaw)
+		}
+	}
 
 	body := []byte{}
 	if method == "POST" || method == "PUT" || method == "PATCH" {
@@ -68,7 +78,7 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 	headers := [][2]string{
 		{":method", "POST"},
 		{":path", "/"},
-		{":authority", ""},
+		{":authority", host},
 		{"X-Crowdsec-Appsec-Ip", ip},
 		{"X-Crowdsec-Appsec-Uri", path},
 		{"X-Crowdsec-Appsec-Host", host},
