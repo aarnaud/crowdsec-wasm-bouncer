@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm"
 	"github.com/proxy-wasm/proxy-wasm-go-sdk/proxywasm/types"
@@ -29,14 +30,15 @@ type CrowdSecConfig struct {
 type LAPIConfig struct {
 	Cluster  string `json:"cluster"`
 	Key      string `json:"key"`
-	SyncFreq int    `json:"sync_freq"` // seconds, default 10
+	SyncFreq int    `json:"sync_freq,omitempty"` // seconds, default 10
 }
 
 type AppSecConfig struct {
 	Enabled   bool   `json:"enabled"`
-	AsyncMode bool   `json:"async_mode"`
-	Cluster   string `json:"cluster"`
-	Key       string `json:"key"`
+	AsyncMode bool   `json:"async_mode,omitempty"`
+	Cluster   string `json:"cluster,omitempty"`
+	Key       string `json:"key,omitempty"`
+	FailOpen  bool   `json:"fail_open,omitempty"`
 }
 
 func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
@@ -61,7 +63,7 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	ctx.config = &config
 	ctx.firstSync = true
 
-	proxywasm.LogInfof("CrowdSec Plugin started - LAPI cluster: %s, AppSec cluster: %s, Appsec enabled: %s",
+	proxywasm.LogInfof("CrowdSec Plugin started - LAPI cluster: %s, AppSec cluster: %s, Appsec enabled: %v",
 		ctx.config.CrowdSec.LAPI.Cluster, ctx.config.CrowdSec.AppSec.Cluster, ctx.config.CrowdSec.AppSec.Enabled)
 
 	// DON'T sync during OnPluginStart - let first OnTick handle it
@@ -148,15 +150,30 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 		}
 	}()
 
-	body, err := proxywasm.GetHttpCallResponseBody(0, bodySize)
+	respheaders, err := proxywasm.GetHttpCallResponseHeaders()
 	if err != nil {
-		proxywasm.LogErrorf("failed to get LAPI response: %v", err)
+		proxywasm.LogErrorf("failed to get lapi decision response headers: %v", err)
+		return
+	}
+	status := 0
+	for _, header := range respheaders {
+		if header[0] == ":status" {
+			status, _ = strconv.Atoi(header[1])
+		}
+	}
+	if status == 503 {
+		proxywasm.LogErrorf("failed to call lapi decision endpoint")
 		return
 	}
 
+	body, err := proxywasm.GetHttpCallResponseBody(0, bodySize)
+	if err != nil {
+		proxywasm.LogErrorf("failed to get LAPI decisions response body: %v", err)
+		return
+	}
 	var resp DecisionsResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		proxywasm.LogErrorf("failed to parse decisions: %v", err)
+		proxywasm.LogErrorf("failed to parse LAPI decisions response: %v", err)
 		return
 	}
 

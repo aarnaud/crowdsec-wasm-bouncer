@@ -11,7 +11,7 @@ Proxy-WASM filter for CrowdSec integration with LAPI stream and AppSec support.
 
 ## Build
 
-**Requirements:** Go 1.24 (for WASM)
+**Requirements:** Go 1.25 (for WASM)
 
 ```
 make build
@@ -35,7 +35,8 @@ Edit `config.json` or inline in `envoy.yaml`:
       "enabled": true,
       "async_mode": false,
       "cluster": "crowdsec_appsec",
-      "key": "your-appsec-key"
+      "key": "your-appsec-key",
+      "fail_open": false
     }
   }
 }
@@ -72,6 +73,7 @@ spec:
         async_mode: false
         cluster: "crowdsec_appsec"
         key: "your-appsec-key"
+        fail_open: false
 ```
 
 ## Architecture

@@ -99,7 +99,7 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 				return
 			}
 
-			status := 500
+			status := 503
 			respheaders, err := proxywasm.GetHttpCallResponseHeaders()
 			if err != nil {
 				proxywasm.LogErrorf("failed to get Appsecc response headers: %v", err)
@@ -111,6 +111,14 @@ func (ctx *httpContext) sendAppSecEvent(ip string) {
 				}
 			}
 
+			if status == 503 {
+				proxywasm.LogErrorf("failed to call Appsecc api, service unavailable")
+				if ctx.config.CrowdSec.AppSec.FailOpen {
+					proxywasm.ResumeHttpRequest()
+					return
+				}
+				proxywasm.LogWarnf("FailOpen is disable, request will be denied")
+			}
 			if status == 200 {
 				proxywasm.ResumeHttpRequest()
 				return
