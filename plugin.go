@@ -34,11 +34,13 @@ type LAPIConfig struct {
 }
 
 type AppSecConfig struct {
-	Enabled   bool   `json:"enabled"`
-	AsyncMode bool   `json:"async_mode,omitempty"`
-	Cluster   string `json:"cluster,omitempty"`
-	Key       string `json:"key,omitempty"`
-	FailOpen  bool   `json:"fail_open,omitempty"`
+	Enabled       bool   `json:"enabled"`
+	AsyncMode     bool   `json:"async_mode,omitempty"`
+	Cluster       string `json:"cluster,omitempty"`
+	Key           string `json:"key,omitempty"`
+	FailOpen      bool   `json:"fail_open,omitempty"`
+	ForwardBody   bool   `json:"forward_body,omitempty"`
+	MaxBodySizeKB int    `json:"max_body_size_kb,omitempty"` // Default: 100KB
 }
 
 func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
@@ -63,6 +65,9 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	// Set defaults
 	if config.CrowdSec.LAPI.SyncFreq == 0 {
 		config.CrowdSec.LAPI.SyncFreq = 10
+	}
+	if config.CrowdSec.AppSec.MaxBodySizeKB == 0 {
+		config.CrowdSec.AppSec.MaxBodySizeKB = 100 // Default: 100KB
 	}
 
 	ctx.config = &config
