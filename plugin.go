@@ -42,6 +42,11 @@ type AppSecConfig struct {
 }
 
 func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPluginStartStatus {
+	defer func() {
+		if err := recover(); err != nil {
+			proxywasm.LogCriticalf("crashed during OnPluginStart: %v", err)
+		}
+	}()
 	proxywasm.LogInfof("CrowdSec Bouncer context(%d) is starting...", ctx.contextID)
 	data, err := proxywasm.GetPluginConfiguration()
 	if err != nil {
