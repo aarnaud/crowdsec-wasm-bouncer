@@ -79,8 +79,25 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 	contentLengthHeader, _ := proxywasm.GetHttpRequestHeader("content-length")
 	ctx.totalBodySize, _ = strconv.Atoi(contentLengthHeader)
 
-	// If endOfStream, there's no body or it's already here
+	// If endOfStream, body is complete (arrived with headers or no body)
 	if endOfStream {
+		// Small body case: read it now since OnHttpRequestBody won't be called
+		if ctx.totalBodySize > 0 {
+			maxBodySizeBytes := ctx.config.CrowdSec.AppSec.MaxBodySizeKB * 1024
+			readSize := ctx.totalBodySize
+			if readSize > maxBodySizeBytes {
+				readSize = maxBodySizeBytes
+			}
+
+			body, err := proxywasm.GetHttpRequestBody(0, readSize)
+			if err != nil {
+				proxywasm.LogWarnf("Failed to read request body: %v", err)
+			} else {
+				ctx.bodyData = body
+				ctx.totalBodySent = len(body)
+			}
+		}
+
 		ctx.sendAppSecEvent()
 		if !ctx.config.CrowdSec.AppSec.AsyncMode {
 			return types.ActionPause
@@ -88,7 +105,7 @@ func (ctx *httpContext) OnHttpRequestHeaders(numHeaders int, endOfStream bool) t
 		return types.ActionContinue
 	}
 
-	// Wait for body in OnHttpRequestBody
+	// Large body case: wait for OnHttpRequestBody to be called
 	return types.ActionContinue
 }
 
