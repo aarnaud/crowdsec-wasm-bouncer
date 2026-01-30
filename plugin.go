@@ -73,8 +73,20 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	ctx.config = &config
 	ctx.firstSync = true
 
-	proxywasm.LogInfof("CrowdSec Plugin started - LAPI cluster: %s, AppSec cluster: %s, Appsec enabled: %v",
-		ctx.config.CrowdSec.LAPI.Cluster, ctx.config.CrowdSec.AppSec.Cluster, ctx.config.CrowdSec.AppSec.Enabled)
+	proxywasm.LogInfof("CrowdSec Plugin started:\n"+
+		"\tLAPI cluster: %s\n"+
+		"\tAppSec cluster: %s\n"+
+		"\tAppsec enabled: %v\n"+
+		"\tAppsec FailOpen: %v\n"+
+		"\tAppsec ForwardBody: %v\n"+
+		"\tAppsec MaxBodySizeKB: %d\n",
+		ctx.config.CrowdSec.LAPI.Cluster,
+		ctx.config.CrowdSec.AppSec.Cluster,
+		ctx.config.CrowdSec.AppSec.Enabled,
+		ctx.config.CrowdSec.AppSec.FailOpen,
+		ctx.config.CrowdSec.AppSec.ForwardBody,
+		ctx.config.CrowdSec.AppSec.MaxBodySizeKB,
+	)
 
 	// DON'T sync during OnPluginStart - let first OnTick handle it
 	// This avoids race conditions when multiple workers start simultaneously
