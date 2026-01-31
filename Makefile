@@ -1,7 +1,7 @@
 .PHONY: build clean docker-build extract-wasm
 
 build:
-	env GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o plugin.wasm main.go plugin.go http.go
+	env GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o plugin.wasm
 
 docker-build:
 	docker build -t crowdsec-wasm-bouncer:latest .

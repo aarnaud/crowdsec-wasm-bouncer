@@ -73,14 +73,16 @@ func (ctx *pluginContext) OnPluginStart(pluginConfigurationSize int) types.OnPlu
 	ctx.config = &config
 	ctx.firstSync = true
 
-	proxywasm.LogInfof("CrowdSec Plugin started:\n"+
+	proxywasm.LogWarnf("CrowdSec Plugin loading:\n"+
 		"\tLAPI cluster: %s\n"+
+		"\tLAPI sync_freq: %d\n"+
 		"\tAppSec cluster: %s\n"+
 		"\tAppsec enabled: %v\n"+
 		"\tAppsec FailOpen: %v\n"+
 		"\tAppsec ForwardBody: %v\n"+
 		"\tAppsec MaxBodySizeKB: %d\n",
 		ctx.config.CrowdSec.LAPI.Cluster,
+		ctx.config.CrowdSec.LAPI.SyncFreq,
 		ctx.config.CrowdSec.AppSec.Cluster,
 		ctx.config.CrowdSec.AppSec.Enabled,
 		ctx.config.CrowdSec.AppSec.FailOpen,
@@ -115,7 +117,7 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 
 	// If lock exists and has data, another thread is syncing
 	if err == nil && len(lockData) > 0 {
-		proxywasm.LogDebugf("Sync already in progress (context %d), skipping", ctx.contextID)
+		proxywasm.LogDebugf("Sync already in progress, skipping")
 		return
 	}
 
@@ -123,11 +125,11 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 	err = proxywasm.SetSharedData(syncLockKey, []byte("locked"), cas)
 	if err != nil {
 		// Another thread acquired the lock first (CAS failed)
-		proxywasm.LogDebugf("Failed to acquire sync lock (context %d), another thread won", ctx.contextID)
+		proxywasm.LogDebugf("Failed to acquire sync lock, another thread won")
 		return
 	}
 
-	proxywasm.LogInfof("Context %d acquired sync lock, starting sync (startup=%v)", ctx.contextID, startup)
+	proxywasm.LogInfof("Lock acquired, starting sync (startup=%v)", startup)
 
 	// Only use startup=true on first sync
 	path := "/v1/decisions/stream"
@@ -140,7 +142,7 @@ func (ctx *pluginContext) syncDecisions(startup bool) {
 		{":path", path},
 		{":authority", ""},
 		{"X-Api-Key", ctx.config.CrowdSec.LAPI.Key},
-		{"user-agent", fmt.Sprintf("crowdsec-wasm-bouncer/ctx-%d", ctx.contextID)},
+		{"user-agent", "crowdsec-wasm-bouncer"},
 	}
 
 	calloutID, err := proxywasm.DispatchHttpCall(
@@ -168,7 +170,7 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 		if err := proxywasm.SetSharedData("crowdsec_sync_lock", nil, 0); err != nil {
 			proxywasm.LogErrorf("Failed to release sync lock: %v", err)
 		} else {
-			proxywasm.LogInfof("Context %d released sync lock", ctx.contextID)
+			proxywasm.LogInfof("Released sync lock")
 		}
 	}()
 
@@ -210,8 +212,8 @@ func (ctx *pluginContext) onLAPIResponse(numHeaders, bodySize, numTrailers int) 
 		proxywasm.SetSharedData(key, nil, 0)
 	}
 
-	proxywasm.LogInfof("Context %d synced decisions: +%d new, -%d deleted",
-		ctx.contextID, len(resp.New), len(resp.Deleted))
+	proxywasm.LogInfof("Synced decisions: +%d new, -%d deleted",
+		len(resp.New), len(resp.Deleted))
 }
 
 func (ctx *pluginContext) NewHttpContext(contextID uint32) types.HttpContext {
