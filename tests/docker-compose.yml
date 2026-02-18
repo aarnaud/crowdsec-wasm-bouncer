@@ -1,0 +1,39 @@
+services:
+  crowdsec:
+    image: crowdsecurity/crowdsec:latest
+    environment:
+      COLLECTIONS: "crowdsecurity/appsec-generic-rules crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-crs crowdsecurity/appsec-crs-inband"
+      BOUNCER_KEY_envoy: "test-bouncer-key"
+      DISABLE_PARSERS: "crowdsecurity/whitelists"
+      APPSEC_CONFIGS: "crowdsecurity/appsec-default"
+    volumes:
+      - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml
+      - ./crowdsec/appsec-configs:/etc/crowdsec/appsec-configs
+      - crowdsec-db:/var/lib/crowdsec/data/
+      - crowdsec-config:/etc/crowdsec/
+    healthcheck:
+      test: ["CMD", "cscli", "version"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  backend:
+    image: ghcr.io/aarnaud/aarnaud/go-httpbin:v2.21.0
+    environment:
+      MAX_BODY_SIZE: "2147483648" # 2G
+
+  envoy:
+    image: envoyproxy/envoy:v1.36-latest
+    ports:
+      - "8000:8000"
+      - "9901:9901"
+    volumes:
+      - ./envoy.yaml:/etc/envoy/envoy.yaml
+      - ../target/wasm32-wasip1/release/crowdsec_wasm_bouncer.wasm:/etc/envoy/plugin.wasm
+    depends_on:
+      crowdsec:
+        condition: service_healthy
+
+volumes:
+  crowdsec-db:
+  crowdsec-config:
