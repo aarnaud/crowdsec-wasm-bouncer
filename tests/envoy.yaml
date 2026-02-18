@@ -40,9 +40,10 @@ static_resources:
                               {
                                 "crowdsec": {
                                   "lapi": {
+                                    "enabled": false,
                                     "cluster": "crowdsec_lapi",
                                     "key": "test-bouncer-key",
-                                    "sync_freq": 600
+                                    "sync_freq": 10
                                   },
                                   "appsec": {
                                     "enabled": true,

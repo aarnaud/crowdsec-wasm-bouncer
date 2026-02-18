@@ -1,19 +1,23 @@
-# Stage 1: Build the WASM plugin
-FROM golang:1.25-alpine AS builder
+# Stage 1: Build the Rust WASM plugin
+FROM rust:1.93-alpine AS builder
+
+RUN apk add --no-cache musl-dev
 
 WORKDIR /build
 
-# Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
+# Install wasm32-wasip1 target
+RUN rustup target add wasm32-wasip1
+
+# Copy Cargo files
+COPY Cargo.toml ./
 
 # Copy source code
-COPY *.go ./
+COPY src/ ./src/
 
-# Build WASM with same flags as Makefile
-RUN GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -o plugin.wasm
+# Build WASM plugin
+RUN cargo build --target wasm32-wasip1 --release
 
 # Stage 2: Create minimal image with only the WASM file
 FROM scratch
 
-COPY --from=builder /build/plugin.wasm /plugin.wasm
+COPY --from=builder /build/target/wasm32-wasip1/release/crowdsec_wasm_bouncer.wasm /plugin.wasm

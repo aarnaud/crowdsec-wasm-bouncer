@@ -1,6 +1,7 @@
 # Ignore build artifacts
 plugin.wasm
 *.wasm
+target
 
 # Ignore git
 .git
