@@ -1,0 +1,81 @@
+flowchart TD
+    A[Client Request] --> B[on_http_request_headers]
+
+    B --> C{LAPI enabled?}
+    C -->|Yes| D{IP in blocklist?}
+    C -->|No| E{AppSec enabled?}
+
+    D -->|Yes| BLOCK403a[403 Access Denied + Pause]
+    D -->|No| E
+
+    E -->|No| CONTINUE[Action::Continue → Backend]
+    E -->|Yes| F{request_has_body?<br>POST/PUT/PATCH<br>+ forward_body}
+
+    F -->|Yes, end_of_stream=false| I[Read content_type<br>Action::Pause]
+    F -->|Yes, end_of_stream=true| H[Read body + content_type<br>from headers callback]
+    F -->|No| G_NO_BODY[send_appsec_event<br>headers only]
+
+    H --> G_WITH_BODY[send_appsec_event<br>with body read at headers]
+
+    G_NO_BODY --> J{async_mode?}
+    G_WITH_BODY --> J
+    J -->|Yes| CONTINUE
+    J -->|No| PAUSE_HEADERS[Action::Pause<br>Wait for AppSec]
+
+    I --> K[on_http_request_body]
+
+    K --> L{appsec_done?}
+    L -->|Yes| CONTINUE_BODY[Action::Continue<br>Body flows to backend]
+
+    L -->|No| M{appsec_pending?}
+    M -->|Yes| PAUSE_BODY[Action::Pause<br>Hold body]
+
+    M -->|No| N[Read body chunk<br>up to max_body_size_kb]
+    N --> O{body >= max_size<br>OR end_of_stream?}
+    O -->|No| PAUSE_BODY
+    O -->|Yes| P[send_appsec_event<br>with body + Content-Type]
+    P --> PAUSE_BODY
+
+    CONTINUE --> BACKEND[Request reaches Backend]
+    CONTINUE_BODY --> BACKEND
+
+    subgraph "on_http_response_headers"
+        T{appsec_pending?}
+        T -->|Yes| PAUSE_RESP[Action::Pause<br>Hold response]
+        T -->|No| CONT_RESP[Action::Continue]
+    end
+
+    BACKEND --> T
+
+    subgraph ASYNC["on_http_call_response (async callback)"]
+        direction TB
+        CALLBACK_IN[AppSec response received] --> Q{HTTP status?}
+        Q -->|200| RESUME[resume_http_request<br>appsec_done = true]
+        Q -->|503| R{fail_open?}
+        Q -->|Other| BLOCK403b[403 AppSec Access Denied]
+        R -->|Yes| RESUME
+        R -->|No| BLOCK403b
+    end
+
+    PAUSE_HEADERS -.->|dispatch_http_call| ASYNC
+    PAUSE_BODY -.->|dispatch_http_call| ASYNC
+
+    RESUME -.->|paused from headers| BACKEND
+    RESUME -.->|paused from body| K
+    BLOCK403b -.->|sends 403 to client| A
+
+    style BLOCK403a fill:#d32f2f,color:#fff
+    style BLOCK403b fill:#d32f2f,color:#fff
+    style CONTINUE fill:#388e3c,color:#fff
+    style CONTINUE_BODY fill:#388e3c,color:#fff
+    style CONT_RESP fill:#388e3c,color:#fff
+    style RESUME fill:#388e3c,color:#fff
+    style BACKEND fill:#1565c0,color:#fff
+    style PAUSE_HEADERS fill:#f57c00,color:#fff
+    style PAUSE_BODY fill:#f57c00,color:#fff
+    style PAUSE_RESP fill:#f57c00,color:#fff
+    style ASYNC fill:#f3e5f5,stroke:#7b1fa2,color:#000
+    style CALLBACK_IN fill:#7b1fa2,color:#fff
+    style G_NO_BODY fill:#7b1fa2,color:#fff
+    style G_WITH_BODY fill:#7b1fa2,color:#fff
+    style P fill:#7b1fa2,color:#fff
