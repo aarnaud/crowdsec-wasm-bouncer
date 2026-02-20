@@ -160,7 +160,18 @@ impl RootContext for CrowdSecPlugin {
         match self.get_plugin_configuration() {
             Some(config_bytes) => {
                 match serde_json::from_slice::<Config>(&config_bytes) {
-                    Ok(config) => {
+                    Ok(mut config) => {
+                        // Fall back to environment variables for empty keys
+                        if config.crowdsec.lapi.key.is_empty() {
+                            if let Ok(key) = std::env::var("CROWDSEC_LAPI_KEY") {
+                                config.crowdsec.lapi.key = key;
+                            }
+                        }
+                        if config.crowdsec.appsec.key.is_empty() {
+                            if let Ok(key) = std::env::var("CROWDSEC_APPSEC_KEY") {
+                                config.crowdsec.appsec.key = key;
+                            }
+                        }
                         log::warn!(
                             "CrowdSec Plugin loading:\n\
                             \tLAPI cluster: {}\n\

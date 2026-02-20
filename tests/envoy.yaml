@@ -34,6 +34,10 @@ static_resources:
                             code:
                               local:
                                 filename: "/etc/envoy/plugin.wasm"
+                            environment_variables:
+                              host_env_keys:
+                                - CROWDSEC_LAPI_KEY
+                                - CROWDSEC_APPSEC_KEY
                           configuration:
                             "@type": "type.googleapis.com/google.protobuf.StringValue"
                             value: |
@@ -42,14 +46,12 @@ static_resources:
                                   "lapi": {
                                     "enabled": false,
                                     "cluster": "crowdsec_lapi",
-                                    "key": "test-bouncer-key",
                                     "sync_freq": 10
                                   },
                                   "appsec": {
                                     "enabled": true,
                                     "async_mode": false,
                                     "cluster": "crowdsec_appsec",
-                                    "key": "test-bouncer-key",
                                     "forward_body": true
                                   }
                                 }

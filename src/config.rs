@@ -14,6 +14,7 @@ pub struct CrowdSecConfig {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LAPIConfig {
     pub cluster: String,
+    #[serde(default)]
     pub key: String,
     #[serde(default = "default_sync_freq")]
     pub sync_freq: u32, // seconds, default 10

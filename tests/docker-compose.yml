@@ -30,6 +30,9 @@ services:
     volumes:
       - ./envoy.yaml:/etc/envoy/envoy.yaml
       - ../target/wasm32-wasip1/release/crowdsec_wasm_bouncer.wasm:/etc/envoy/plugin.wasm
+    environment:
+      CROWDSEC_LAPI_KEY: "test-bouncer-key"
+      CROWDSEC_APPSEC_KEY: "test-bouncer-key"
     depends_on:
       crowdsec:
         condition: service_healthy
