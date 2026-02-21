@@ -34,11 +34,15 @@ extract-wasm:
 	docker cp wasm-extract:/plugin.wasm ./plugin.wasm
 	docker rm wasm-extract
 
-# Integration tests
-integration-test: crowdsec_wasm_bouncer.wasm
-	cd tests && docker compose up -d --wait --force-recreate
+docker-up:
+	cd tests && docker compose up -d --wait
 	@sleep 5
-	cd tests && bash run_tests.sh; ret=$$?; docker compose logs envoy crowdsec > test-output.log 2>&1; exit $$ret
 
-integration-test-down:
+docker-down:
 	cd tests && docker compose down -v
+
+# Integration tests
+integration-test: crowdsec_wasm_bouncer.wasm docker-up
+	cd tests && docker compose restart envoy
+	@sleep 2
+	cd tests && bash run_tests.sh; ret=$$?; exit $$ret
