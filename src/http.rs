@@ -15,6 +15,7 @@ pub struct CrowdSecHttpContext {
     body_data: Vec<u8>,
     appsec_pending: bool,
     appsec_done: bool,
+    response_paused: bool,
 }
 
 impl CrowdSecHttpContext {
@@ -30,6 +31,7 @@ impl CrowdSecHttpContext {
             body_data: Vec::new(),
             appsec_pending: false,
             appsec_done: false,
+            response_paused: false,
         }
     }
 
@@ -69,6 +71,9 @@ impl CrowdSecHttpContext {
                 if self.config.crowdsec.appsec.fail_open {
                     self.appsec_done = true;
                     self.resume_http_request();
+                    if self.response_paused {
+                        self.resume_http_response();
+                    }
                 } else {
                     self.send_http_response(
                         403,
@@ -132,6 +137,9 @@ impl Context for CrowdSecHttpContext {
             if self.config.crowdsec.appsec.fail_open {
                 self.appsec_done = true;
                 self.resume_http_request();
+                if self.response_paused {
+                    self.resume_http_response();
+                }
                 return;
             }
             log::warn!("fail_open disabled, denying request");
@@ -141,9 +149,11 @@ impl Context for CrowdSecHttpContext {
             log::info!("AppSec allows request, resuming");
             self.appsec_done = true;
             self.resume_http_request();
+            if self.response_paused {
+                self.resume_http_response();
+            }
         } else {
-            log::warn!("AppSec blocking request from {} (status: {})", self.ip, status);
-            self.send_http_response(
+            log::warn!("AppSec blocking request from {} (status: {})", self.ip, status);            self.send_http_response(
                 403,
                 vec![("content-type", "text/plain")],
                 Some(b"AppSec Access Denied"),
@@ -280,6 +290,7 @@ impl HttpContext for CrowdSecHttpContext {
     fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
         if self.appsec_pending {
             log::info!("AppSec pending, pausing response");
+            self.response_paused = true;
             return Action::Pause;
         }
         Action::Continue
