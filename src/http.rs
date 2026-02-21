@@ -36,6 +36,16 @@ impl CrowdSecHttpContext {
     }
 
     fn send_appsec_event(&mut self) {
+        // Truncate at the first non-printable byte so only clean text reaches AppSec
+        if let Some(pos) = self
+            .body_data
+            .iter()
+            .position(|&b| !matches!(b, 0x09 | 0x0A | 0x0D | 0x20..=0x7E))
+        {
+            log::debug!("Truncating body at non-printable byte (pos {})", pos);
+            self.body_data.truncate(pos);
+        }
+
         let mut headers = vec![
             (":method", "POST"),
             (":path", "/"),
@@ -105,29 +115,6 @@ impl CrowdSecHttpContext {
     fn request_has_body(&self) -> bool {
         self.config.crowdsec.appsec.forward_body
             && matches!(self.method.as_str(), "POST" | "PUT" | "PATCH")
-    }
-
-    /// Only forward body to AppSec for content types it can meaningfully inspect.
-    /// Binary/compressed bodies produce false positives (null bytes, CR/LF, etc.).
-    fn body_is_inspectable(&self) -> bool {
-        if self.content_type.is_empty() {
-            return true;
-        }
-        let ct = self.content_type.to_lowercase();
-        let media = ct.split(';').next().unwrap_or("").trim();
-        matches!(
-            media,
-            "application/x-www-form-urlencoded"
-                | "application/json"
-                | "application/xml"
-                | "application/soap+xml"
-                | "application/xhtml+xml"
-                | "application/graphql"
-                | "application/csp-report"
-        ) || media.starts_with("text/")
-            || media.starts_with("multipart/")
-            || media.ends_with("+json")
-            || media.ends_with("+xml")
     }
 }
 
@@ -249,33 +236,15 @@ impl HttpContext for CrowdSecHttpContext {
                 .get_http_request_header("content-type")
                 .unwrap_or_default();
 
-            if self.body_is_inspectable() {
-                if !end_of_stream {
-                    // Inspectable body: continue to let body callbacks fire
-                    log::info!(
-                        "Request has inspectable body, continuing headers (body will be held)"
-                    );
-                    return Action::Continue;
-                }
-                // Small inspectable body arrived with headers, read it now
-                let max_size = self.max_body_size();
-                if let Some(body) = self.get_http_request_body(0, max_size) {
-                    log::info!(
-                        "Read {} bytes of body at headers (end_of_stream=true)",
-                        body.len()
-                    );
-                    self.body_data = body;
-                }
-            } else {
-                // Non-inspectable body (binary/compressed): headers-only check,
-                // pause here, on_http_request_body returns Continue to let body
-                // stream. AppSec responds fast and resume_http_request releases all.
-                log::info!(
-                    "Body not inspectable ({}), headers-only AppSec check",
-                    self.content_type
-                );
-                self.send_appsec_event();
-                return Action::Pause;
+            if !end_of_stream {
+                log::info!("Request has body, waiting for body data");
+                return Action::Continue;
+            }
+            // Body arrived with headers (end_of_stream=true): read it now
+            let max_size = self.max_body_size();
+            if let Some(body) = self.get_http_request_body(0, max_size) {
+                log::info!("Read {} bytes of body at headers", body.len());
+                self.body_data = body;
             }
         }
 
@@ -304,24 +273,21 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // Non-inspectable body: AppSec was dispatched with headers only,
-        // let the body stream through while waiting for the response
-        if !self.body_is_inspectable() {
+        // prevent 413 when buffer is bigger that 512k
+        if self.appsec_pending && body_size > 512 * 1024 {
             return Action::Continue;
-        }
-
-        // Waiting on AppSec response, keep holding body
-        if self.appsec_pending {
-            return Action::Pause;
         }
 
         // Accumulate body up to max_body_size_kb
         let max_size = self.max_body_size();
         if body_size > 0 && self.body_data.len() < max_size {
-            let read_size = body_size.min(max_size);
-            if let Some(body) = self.get_http_request_body(0, read_size) {
-                self.body_data = body;
-                log::debug!("Buffered {} bytes of body", self.body_data.len());
+            let offset = self.body_data.len();
+            let read_size = body_size.saturating_sub(offset).min(max_size - offset);
+            if read_size > 0 {
+                if let Some(chunk) = self.get_http_request_body(offset, read_size) {
+                    self.body_data.extend_from_slice(&chunk);
+                    log::debug!("Buffered {} bytes of body", self.body_data.len());
+                }
             }
         }
 
@@ -335,7 +301,7 @@ impl HttpContext for CrowdSecHttpContext {
             self.send_appsec_event();
         }
 
-        Action::Pause
+        Action::Continue
     }
 
     fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {

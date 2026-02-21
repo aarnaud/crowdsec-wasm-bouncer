@@ -41,7 +41,7 @@ make clippy                # cargo clippy -- -D warnings
 
 # Integration tests (requires Docker)
 make integration-test      # builds WASM, starts docker-compose, runs tests/run_tests.sh
-make integration-test-down # tears down containers
+make docker-down # tears down containers
 
 # Docker
 make docker-build          # builds image crowdsec-wasm-bouncer:latest
