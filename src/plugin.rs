@@ -122,8 +122,11 @@ impl Context for CrowdSecPlugin {
             .parse::<u32>()
             .unwrap_or(503);
 
-        if status == 503 {
-            log::error!("failed to call lapi decision endpoint");
+        if status != 200 {
+            log::error!(
+                "LAPI decision endpoint returned unexpected status: {}",
+                status
+            );
             return;
         }
 
