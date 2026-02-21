@@ -6,8 +6,8 @@ Proxy-WASM filter for CrowdSec integration with LAPI stream and AppSec support.
 
 - **LAPI Stream**: Periodic decision sync every 10s (configurable)
 - **Shared memory**: Decisions stored in proxy shared data (accessible across workers)
-- **AppSec**: Async event reporting (non-blocking or blocking) (configurable)
-- **IP blocking**: Checks decisions on each request
+- **AppSec**: Async/Sync event reporting (non-blocking or blocking) (configurable)
+- **IP blocking**: Checks decisions on each request (configurable)
 
 ## Project Structure
 
@@ -31,24 +31,28 @@ Edit `config.json` or inline in `envoy.yaml`:
 
 ```json
 {
-  "crowdsec": {
-    "lapi": {
-      "cluster": "crowdsec_lapi",
-      "key": "your-lapi-key",
-      "sync_freq": 30
-    },
-    "appsec": {
-      "enabled": true,
-      "async_mode": false,
-      "cluster": "crowdsec_appsec",
-      "key": "your-appsec-key",
-      "fail_open": false
+    "crowdsec": {
+      "lapi": {
+        "enabled": true,
+        "cluster": "crowdsec_lapi",
+        "sync_freq": 10
+      },
+      "appsec": {
+        "enabled": true,
+        "async_mode": false,
+        "cluster": "crowdsec_appsec",
+        "forward_body": true,
+        "max_body_size_kb": 8
+      }
     }
-  }
 }
 ```
 
 ## Deploy
+
+### Envoy 
+
+Exemple here [envoy.yaml](tests/envoy.yaml)
 
 ### Envoy Gateway
 
@@ -78,7 +82,7 @@ spec:
                     - endpoint:
                         address:
                           socket_address:
-                            address: crowdsec-service.security.svc.cluster.local.
+                            address: crowdsec-service.crowdsec.svc.cluster.local.
                             port_value: 8080
           - name: crowdsec_appsec
             type: STRICT_DNS
@@ -90,7 +94,7 @@ spec:
                     - endpoint:
                         address:
                           socket_address:
-                            address: crowdsec-appsec-service.security.svc.cluster.local.
+                            address: crowdsec-appsec-service.crowdsec.svc.cluster.local.
                             port_value: 7422
 ---
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -107,47 +111,94 @@ spec:
         type: Image
         image:
           url: ghcr.io/aarnaud/crowdsec-wasm-bouncer:vx.x.x
-      failOpen: true
+      failOpen: false
+      env:
+        hostKeys:
+          - CROWDSEC_LAPI_KEY
+          - CROWDSEC_APPSEC_KEY
       config:
         crowdsec:
           lapi:
+            enabled: true
             cluster: crowdsec_lapi
-            key: ""your-key"
-            sync_freq: 60
+            #key: "YOUR_KEY_IF_NOT_IN_ENV"
+            sync_freq: 10
           appsec:
             enabled: true
-            async_mode: false
             cluster: crowdsec_appsec
-            key: "your-appsec-key"
+            #key: "YOUR_KEY_IF_NOT_IN_ENV"
+            async_mode: false
             fail_open: false
             forward_body: true
-            max_body_size_kb: 100
+            max_body_size_kb: 8
 ```
 
 ### Istio
 
 ```yaml
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: crowdsec-lapi
+spec:
+  hosts:
+    - crowdsec-lapi.internal
+  ports:
+    - number: 8080
+      name: http
+      protocol: HTTP
+  resolution: DNS
+  location: MESH_INTERNAL
+  endpoints:
+    - address: crowdsec-service.crowdsec.svc.cluster.local
+      ports:
+        http: 8080
+---
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: crowdsec-appsec
+spec:
+  hosts:
+    - crowdsec-appsec.internal
+  ports:
+    - number: 7422
+      name: http
+      protocol: HTTP
+  resolution: DNS
+  location: MESH_INTERNAL
+  endpoints:
+    - address: crowdsec-appsec-service.crowdsec.svc.cluster.local
+      ports:
+        http: 7422
+---
 apiVersion: extensions.istio.io/v1alpha1
 kind: WasmPlugin
 metadata:
-  name: crowdsec-bouncer
+  name: crowdsec
 spec:
-  selector:
-    matchLabels:
-      app: myapp
-  url: file:///path/to/main.wasm
+  targetRefs:
+    - kind: Gateway
+      group: gateway.networking.k8s.io
+      name: yourgateway
+  url: oci://ghcr.io/aarnaud/crowdsec-wasm-bouncer:vx.x.x
+  imagePullPolicy: IfNotPresent
+  phase: AUTHN
   pluginConfig:
     crowdsec:
       lapi:
-        cluster: "crowdsec_lapi"
-        key: "your-key"
-        sync_freq: 30
+        enabled: false
+        cluster: "inbound-vip|8080|http|crowdsec-lapi.internal"
+        #key: "YOUR_KEY_IF_NOT_IN_ENV"
+        sync_freq: 10
       appsec:
         enabled: true
+        cluster: "inbound-vip|7422|http|crowdsec-appsec.internal"
+        #key: "YOUR_KEY_IF_NOT_IN_ENV"
         async_mode: false
-        cluster: "crowdsec_appsec"
-        key: "your-appsec-key"
         fail_open: false
+        forward_body: true
+        max_body_size_kb: 8
 ```
 
 ## Architecture
