@@ -52,7 +52,8 @@ static_resources:
                                     "enabled": true,
                                     "async_mode": false,
                                     "cluster": "crowdsec_appsec",
-                                    "forward_body": true
+                                    "forward_body": true,
+                                    "max_body_size_kb": 64
                                   }
                                 }
                               }
