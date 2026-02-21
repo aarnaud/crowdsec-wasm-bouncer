@@ -45,14 +45,20 @@ impl CrowdSecHttpContext {
             ("X-Crowdsec-Appsec-Host", self.host.as_str()),
             ("X-Crowdsec-Appsec-Verb", self.method.as_str()),
             ("X-Crowdsec-Appsec-User-Agent", self.user_agent.as_str()),
-            ("X-Crowdsec-Appsec-Api-Key", self.config.crowdsec.appsec.key.as_str()),
+            (
+                "X-Crowdsec-Appsec-Api-Key",
+                self.config.crowdsec.appsec.key.as_str(),
+            ),
         ];
         if !self.content_type.is_empty() && !self.body_data.is_empty() {
             headers.push(("Content-Type", self.content_type.as_str()));
         }
 
-        log::info!("Sending AppSec event to cluster: {}, body length: {}",
-                  self.config.crowdsec.appsec.cluster, self.body_data.len());
+        log::info!(
+            "Sending AppSec event to cluster: {}, body length: {}",
+            self.config.crowdsec.appsec.cluster,
+            self.body_data.len()
+        );
 
         match self.dispatch_http_call(
             &self.config.crowdsec.appsec.cluster,
@@ -63,17 +69,16 @@ impl CrowdSecHttpContext {
         ) {
             Ok(call_id) => {
                 self.appsec_pending = true;
-                log::info!("AppSec call dispatched successfully with call_id: {}", call_id);
+                log::info!(
+                    "AppSec call dispatched successfully with call_id: {}",
+                    call_id
+                );
             }
             Err(e) => {
                 log::error!("Failed to dispatch AppSec call: {:?}", e);
                 self.appsec_pending = false;
                 if self.config.crowdsec.appsec.fail_open {
-                    self.appsec_done = true;
-                    self.resume_http_request();
-                    if self.response_paused {
-                        self.resume_http_response();
-                    }
+                    self.allow_and_resume();
                 } else {
                     self.send_http_response(
                         403,
@@ -83,6 +88,18 @@ impl CrowdSecHttpContext {
                 }
             }
         }
+    }
+
+    fn allow_and_resume(&mut self) {
+        self.appsec_done = true;
+        self.resume_http_request();
+        if self.response_paused {
+            self.resume_http_response();
+        }
+    }
+
+    fn max_body_size(&self) -> usize {
+        (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024
     }
 
     fn request_has_body(&self) -> bool {
@@ -98,14 +115,15 @@ impl CrowdSecHttpContext {
         }
         let ct = self.content_type.to_lowercase();
         let media = ct.split(';').next().unwrap_or("").trim();
-        matches!(media,
+        matches!(
+            media,
             "application/x-www-form-urlencoded"
-            | "application/json"
-            | "application/xml"
-            | "application/soap+xml"
-            | "application/xhtml+xml"
-            | "application/graphql"
-            | "application/csp-report"
+                | "application/json"
+                | "application/xml"
+                | "application/soap+xml"
+                | "application/xhtml+xml"
+                | "application/graphql"
+                | "application/csp-report"
         ) || media.starts_with("text/")
             || media.starts_with("multipart/")
             || media.ends_with("+json")
@@ -121,7 +139,11 @@ impl Context for CrowdSecHttpContext {
         body_size: usize,
         _num_trailers: usize,
     ) {
-        log::info!("AppSec response received - token_id: {}, body_size: {}", token_id, body_size);
+        log::info!(
+            "AppSec response received - token_id: {}, body_size: {}",
+            token_id,
+            body_size
+        );
         self.appsec_pending = false;
 
         let status = self
@@ -135,11 +157,7 @@ impl Context for CrowdSecHttpContext {
         if status == 503 {
             log::error!("AppSec API unavailable");
             if self.config.crowdsec.appsec.fail_open {
-                self.appsec_done = true;
-                self.resume_http_request();
-                if self.response_paused {
-                    self.resume_http_response();
-                }
+                self.allow_and_resume();
                 return;
             }
             log::warn!("fail_open disabled, denying request");
@@ -147,13 +165,14 @@ impl Context for CrowdSecHttpContext {
 
         if status == 200 {
             log::info!("AppSec allows request, resuming");
-            self.appsec_done = true;
-            self.resume_http_request();
-            if self.response_paused {
-                self.resume_http_response();
-            }
+            self.allow_and_resume();
         } else {
-            log::warn!("AppSec blocking request from {} (status: {})", self.ip, status);            self.send_http_response(
+            log::warn!(
+                "AppSec blocking request from {} (status: {})",
+                self.ip,
+                status
+            );
+            self.send_http_response(
                 403,
                 vec![("content-type", "text/plain")],
                 Some(b"AppSec Access Denied"),
@@ -183,8 +202,12 @@ impl HttpContext for CrowdSecHttpContext {
 
         self.path = self.get_http_request_header(":path").unwrap_or_default();
         self.method = self.get_http_request_header(":method").unwrap_or_default();
-        self.user_agent = self.get_http_request_header("user-agent").unwrap_or_default();
-        self.host = self.get_http_request_header(":authority").unwrap_or_default();
+        self.user_agent = self
+            .get_http_request_header("user-agent")
+            .unwrap_or_default();
+        self.host = self
+            .get_http_request_header(":authority")
+            .unwrap_or_default();
 
         log::info!("Request: {} {} from {}", self.method, self.path, self.ip);
 
@@ -194,7 +217,11 @@ impl HttpContext for CrowdSecHttpContext {
             let (decision_data, _) = self.get_shared_data(&key);
             if let Some(decision) = decision_data {
                 if !decision.is_empty() {
-                    log::warn!("Blocking IP {}: {}", self.ip, String::from_utf8_lossy(&decision));
+                    log::warn!(
+                        "Blocking IP {}: {}",
+                        self.ip,
+                        String::from_utf8_lossy(&decision)
+                    );
                     self.send_http_response(
                         403,
                         vec![("content-type", "text/plain")],
@@ -210,28 +237,35 @@ impl HttpContext for CrowdSecHttpContext {
         }
 
         if self.request_has_body() {
-            self.content_type = self.get_http_request_header("content-type").unwrap_or_default();
+            self.content_type = self
+                .get_http_request_header("content-type")
+                .unwrap_or_default();
 
-            if self.body_is_inspectable() && !end_of_stream {
-                // Inspectable body: continue to let body callbacks fire
-                log::info!("Request has inspectable body, continuing headers (body will be held)");
-                return Action::Continue;
-            }
-
-            if self.body_is_inspectable() && end_of_stream {
+            if self.body_is_inspectable() {
+                if !end_of_stream {
+                    // Inspectable body: continue to let body callbacks fire
+                    log::info!(
+                        "Request has inspectable body, continuing headers (body will be held)"
+                    );
+                    return Action::Continue;
+                }
                 // Small inspectable body arrived with headers, read it now
-                let max_size = (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024;
+                let max_size = self.max_body_size();
                 if let Some(body) = self.get_http_request_body(0, max_size) {
-                    log::info!("Read {} bytes of body at headers (end_of_stream=true)", body.len());
+                    log::info!(
+                        "Read {} bytes of body at headers (end_of_stream=true)",
+                        body.len()
+                    );
                     self.body_data = body;
                 }
-            }
-
-            if !self.body_is_inspectable() {
+            } else {
                 // Non-inspectable body (binary/compressed): headers-only check,
                 // pause here, on_http_request_body returns Continue to let body
                 // stream. AppSec responds fast and resume_http_request releases all.
-                log::info!("Body not inspectable ({}), headers-only AppSec check", self.content_type);
+                log::info!(
+                    "Body not inspectable ({}), headers-only AppSec check",
+                    self.content_type
+                );
                 self.send_appsec_event();
                 return Action::Pause;
             }
@@ -247,7 +281,11 @@ impl HttpContext for CrowdSecHttpContext {
     }
 
     fn on_http_request_body(&mut self, body_size: usize, end_of_stream: bool) -> Action {
-        log::info!("on_http_request_body: body_size={}, end_of_stream={}", body_size, end_of_stream);
+        log::debug!(
+            "on_http_request_body: body_size={}, end_of_stream={}",
+            body_size,
+            end_of_stream
+        );
 
         if !self.config.crowdsec.appsec.enabled {
             return Action::Continue;
@@ -258,7 +296,8 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // Non-inspectable body: let it stream through
+        // Non-inspectable body: AppSec was dispatched with headers only,
+        // let the body stream through while waiting for the response
         if !self.body_is_inspectable() {
             return Action::Continue;
         }
@@ -269,18 +308,22 @@ impl HttpContext for CrowdSecHttpContext {
         }
 
         // Accumulate body up to max_body_size_kb
-        let max_size = (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024;
+        let max_size = self.max_body_size();
         if body_size > 0 && self.body_data.len() < max_size {
             let read_size = body_size.min(max_size);
             if let Some(body) = self.get_http_request_body(0, read_size) {
                 self.body_data = body;
-                log::info!("Buffered {} bytes of body", self.body_data.len());
+                log::debug!("Buffered {} bytes of body", self.body_data.len());
             }
         }
 
         // Dispatch AppSec once we have enough data or stream ends
         if self.body_data.len() >= max_size || end_of_stream {
-            log::info!("Dispatching AppSec: {} bytes, end_of_stream={}", self.body_data.len(), end_of_stream);
+            log::info!(
+                "Dispatching AppSec: {} bytes, end_of_stream={}",
+                self.body_data.len(),
+                end_of_stream
+            );
             self.send_appsec_event();
         }
 

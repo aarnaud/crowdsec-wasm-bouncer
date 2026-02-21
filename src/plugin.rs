@@ -1,10 +1,27 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
+use serde::Deserialize;
 use std::time::Duration;
 
 use crate::config::Config;
 use crate::http::CrowdSecHttpContext;
-use crate::DecisionsResponse;
+
+#[derive(Deserialize)]
+struct DecisionsResponse {
+    #[serde(default)]
+    new: Option<Vec<Decision>>,
+    #[serde(default)]
+    deleted: Option<Vec<Decision>>,
+}
+
+#[derive(Deserialize)]
+struct Decision {
+    #[serde(rename = "type")]
+    decision_type: String,
+    scope: String,
+    value: String,
+    scenario: String,
+}
 
 pub struct CrowdSecPlugin {
     config: Option<Config>,

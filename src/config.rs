@@ -37,7 +37,7 @@ pub struct AppSecConfig {
     #[serde(default)]
     pub forward_body: bool,
     #[serde(default = "default_max_body_size_kb")]
-    pub max_body_size_kb: u32, // Default: 100KB
+    pub max_body_size_kb: u32,
 }
 
 fn default_sync_freq() -> u32 {
