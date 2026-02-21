@@ -8,7 +8,8 @@ inband_rules:
   - crowdsecurity/appsec-generic-test
 on_load:
   - apply:
-    - RemoveInBandRuleByID(911100)
+    - RemoveInBandRuleByID(911100) # Method is not allowed by policy
+    - RemoveInBandRuleByID(920420) # Request content type is not allowed by policy
 inband_options:
   disable_body_inspection: false
   request_body_in_memory_limit: 102400
