@@ -191,14 +191,22 @@ impl HttpContext for CrowdSecHttpContext {
             })
             .unwrap_or_default();
 
-        // source.address returns IP:port, strip the port
+        // source.address may return IP:port — strip the port robustly.
+        // Bracketed IPv6: "[::1]:8080" → strip brackets and ":port"
+        // IPv4 with port: "1.2.3.4:8080" → strip ":port" (exactly one colon)
+        // Bare IPv6: "::1" or "2001:db8::1" → multiple colons, no brackets, leave as-is
+        if self.ip.starts_with('[') {
+            // Bracketed IPv6: find the closing ']', discard everything after it
+            if let Some(close) = self.ip.find(']') {
+                self.ip = self.ip[1..close].to_string();
+            }
+        } else if self.ip.matches(':').count() == 1 {
+            // IPv4:port — single colon means it must be a port separator
         if let Some(idx) = self.ip.rfind(':') {
-            if self.ip[..idx].contains('.') || self.ip[..idx].contains(']') {
                 self.ip = self.ip[..idx].to_string();
             }
         }
-        // Strip brackets from IPv6
-        self.ip = self.ip.trim_matches(|c| c == '[' || c == ']').to_string();
+        // Bare IPv6 (multiple colons, no brackets): leave unchanged
 
         self.path = self.get_http_request_header(":path").unwrap_or_default();
         self.method = self.get_http_request_header(":method").unwrap_or_default();
