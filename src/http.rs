@@ -45,7 +45,7 @@ impl CrowdSecHttpContext {
             ("X-Crowdsec-Appsec-User-Agent", self.user_agent.as_str()),
             ("X-Crowdsec-Appsec-Api-Key", self.config.crowdsec.appsec.key.as_str()),
         ];
-        if !self.content_type.is_empty() {
+        if !self.content_type.is_empty() && !self.body_data.is_empty() {
             headers.push(("Content-Type", self.content_type.as_str()));
         }
 
@@ -83,6 +83,28 @@ impl CrowdSecHttpContext {
     fn request_has_body(&self) -> bool {
         self.config.crowdsec.appsec.forward_body
             && matches!(self.method.as_str(), "POST" | "PUT" | "PATCH")
+    }
+
+    /// Only forward body to AppSec for content types it can meaningfully inspect.
+    /// Binary/compressed bodies produce false positives (null bytes, CR/LF, etc.).
+    fn body_is_inspectable(&self) -> bool {
+        if self.content_type.is_empty() {
+            return true;
+        }
+        let ct = self.content_type.to_lowercase();
+        let media = ct.split(';').next().unwrap_or("").trim();
+        matches!(media,
+            "application/x-www-form-urlencoded"
+            | "application/json"
+            | "application/xml"
+            | "application/soap+xml"
+            | "application/xhtml+xml"
+            | "application/graphql"
+            | "application/csp-report"
+        ) || media.starts_with("text/")
+            || media.starts_with("multipart/")
+            || media.ends_with("+json")
+            || media.ends_with("+xml")
     }
 }
 
@@ -177,30 +199,35 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // Body methods: Continue to let headers through to router so body
-        // callbacks fire. Body will be held in on_http_request_body.
-        // Headers reaching the backend is harmless — the backend can't
-        // process a POST/PUT/PATCH without body data.
-        // If AppSec blocks, send_http_response(403) resets the upstream.
-        // on_http_response_headers pauses any early backend response.
-        if self.request_has_body() && !end_of_stream {
-            self.content_type = self.get_http_request_header("content-type").unwrap_or_default();
-            log::info!("Request has body, continuing headers (body will be held)");
-            return Action::Continue;
-        }
-
-        // Body method with end_of_stream=true: small body arrived with headers.
-        // on_http_request_body won't be called, so read body here.
         if self.request_has_body() {
             self.content_type = self.get_http_request_header("content-type").unwrap_or_default();
-            let max_size = (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024;
-            if let Some(body) = self.get_http_request_body(0, max_size) {
-                log::info!("Read {} bytes of body at headers (end_of_stream=true)", body.len());
-                self.body_data = body;
+
+            if self.body_is_inspectable() && !end_of_stream {
+                // Inspectable body: continue to let body callbacks fire
+                log::info!("Request has inspectable body, continuing headers (body will be held)");
+                return Action::Continue;
+            }
+
+            if self.body_is_inspectable() && end_of_stream {
+                // Small inspectable body arrived with headers, read it now
+                let max_size = (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024;
+                if let Some(body) = self.get_http_request_body(0, max_size) {
+                    log::info!("Read {} bytes of body at headers (end_of_stream=true)", body.len());
+                    self.body_data = body;
+                }
+            }
+
+            if !self.body_is_inspectable() {
+                // Non-inspectable body (binary/compressed): headers-only check,
+                // pause here, on_http_request_body returns Continue to let body
+                // stream. AppSec responds fast and resume_http_request releases all.
+                log::info!("Body not inspectable ({}), headers-only AppSec check", self.content_type);
+                self.send_appsec_event();
+                return Action::Pause;
             }
         }
 
-        // No body, or body read above: dispatch AppSec now and pause
+        // No body or inspectable body already read: dispatch AppSec
         self.send_appsec_event();
         if self.config.crowdsec.appsec.async_mode {
             Action::Continue
@@ -216,8 +243,13 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // AppSec already approved, let remaining body flow
+        // AppSec already decided, let body flow
         if self.appsec_done {
+            return Action::Continue;
+        }
+
+        // Non-inspectable body: let it stream through
+        if !self.body_is_inspectable() {
             return Action::Continue;
         }
 
@@ -242,14 +274,10 @@ impl HttpContext for CrowdSecHttpContext {
             self.send_appsec_event();
         }
 
-        // Hold body until AppSec decides
         Action::Pause
     }
 
     fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
-        // If AppSec check is still in-flight, hold the response.
-        // This handles the case where the backend responds to headers alone
-        // before AppSec has made a decision.
         if self.appsec_pending {
             log::info!("AppSec pending, pausing response");
             return Action::Pause;

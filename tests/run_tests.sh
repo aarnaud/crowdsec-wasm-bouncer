@@ -230,10 +230,10 @@ fi
 # 1GB POST legitimate — should pass (200)
 TOTAL=$((TOTAL + 1))
 description="1GB POST legitimate payload"
-status=$( (printf "data="; dd if=/dev/urandom bs=1M count=1024 status=none) \
+status=$(dd if=/dev/urandom bs=1M count=1024 status=none \
     | curl -s -o /dev/null -w '%{http_code}' \
         -X POST "$ENVOY_URL/post/discard" \
-        -H "Content-Type: application/x-www-form-urlencoded" \
+        -H "Content-Type: application/octet-stream" \
         -T - 2>/dev/null) || true
 if [ "$status" = "200" ]; then
     echo -e "${GREEN}PASS${NC} [$status] $description"
