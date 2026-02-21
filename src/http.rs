@@ -189,7 +189,7 @@ impl HttpContext for CrowdSecHttpContext {
             }
         } else if self.ip.matches(':').count() == 1 {
             // IPv4:port — single colon means it must be a port separator
-        if let Some(idx) = self.ip.rfind(':') {
+            if let Some(idx) = self.ip.rfind(':') {
                 self.ip = self.ip[..idx].to_string();
             }
         }
