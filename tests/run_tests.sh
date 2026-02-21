@@ -216,7 +216,7 @@ TOTAL=$((TOTAL + 1))
 description="1GB POST with SQLi in first line"
 status=$( (printf "username=admin' OR 1=1--&data="; dd if=/dev/urandom bs=1M count=1024 status=none) \
     | curl -s -o /dev/null -w '%{http_code}' \
-        -X POST "$ENVOY_URL/post/discard" \
+        -X POST "$ENVOY_URL/upload" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -T - 2>/dev/null) || true
 if [ "$status" = "403" ]; then
@@ -232,7 +232,7 @@ TOTAL=$((TOTAL + 1))
 description="1GB POST legitimate payload"
 status=$(dd if=/dev/urandom bs=1M count=1024 status=none \
     | curl -s -o /dev/null -w '%{http_code}' \
-        -X POST "$ENVOY_URL/post/discard" \
+        -X POST "$ENVOY_URL/upload" \
         -H "Content-Type: application/octet-stream" \
         -T - 2>/dev/null) || true
 if [ "$status" = "200" ]; then
