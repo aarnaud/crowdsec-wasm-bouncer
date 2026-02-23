@@ -1,0 +1,111 @@
+static_resources:
+  listeners:
+    - name: main
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 8000
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                codec_type: AUTO
+                route_config:
+                  name: local_route
+                  virtual_hosts:
+                    - name: backend
+                      domains: ["*"]
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: backend_service
+                http_filters:
+                  - name: envoy.filters.http.wasm
+                    typed_config:
+                      "@type": type.googleapis.com/udpa.type.v1.TypedStruct
+                      type_url: type.googleapis.com/envoy.extensions.filters.http.wasm.v3.Wasm
+                      value:
+                        config:
+                          vm_config:
+                            runtime: "envoy.wasm.runtime.v8"
+                            code:
+                              local:
+                                filename: "/etc/envoy/plugin.wasm"
+                            environment_variables:
+                              host_env_keys:
+                                - CROWDSEC_LAPI_KEY
+                                - CROWDSEC_APPSEC_KEY
+                          configuration:
+                            "@type": "type.googleapis.com/google.protobuf.StringValue"
+                            value: |
+                              {
+                                "crowdsec": {
+                                  "lapi": {
+                                    "enabled": false,
+                                    "cluster": "crowdsec_lapi",
+                                    "sync_freq": 10
+                                  },
+                                  "appsec": {
+                                    "enabled": true,
+                                    "async_mode": true,
+                                    "cluster": "crowdsec_appsec",
+                                    "forward_body": true,
+                                    "max_body_size_kb": 64
+                                  }
+                                }
+                              }
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: backend_service
+      connect_timeout: 5s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: backend_service
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: backend
+                      port_value: 8080
+
+    - name: crowdsec_lapi
+      connect_timeout: 5s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: crowdsec_lapi
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: crowdsec
+                      port_value: 8080
+
+    - name: crowdsec_appsec
+      connect_timeout: 2s
+      type: STRICT_DNS
+      lb_policy: ROUND_ROBIN
+      load_assignment:
+        cluster_name: crowdsec_appsec
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: crowdsec
+                      port_value: 7422
+
+admin:
+  address:
+    socket_address:
+      address: 0.0.0.0
+      port_value: 9901

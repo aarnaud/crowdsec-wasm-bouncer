@@ -87,7 +87,8 @@ impl CrowdSecHttpContext {
             Err(e) => {
                 log::error!("Failed to dispatch AppSec call: {:?}", e);
                 self.appsec_pending = false;
-                if self.config.crowdsec.appsec.fail_open {
+                // Async mode always passes; fail_open passes on errors
+                if self.config.crowdsec.appsec.async_mode || self.config.crowdsec.appsec.fail_open {
                     self.allow_and_resume();
                 } else {
                     self.send_http_response(
@@ -141,19 +142,20 @@ impl Context for CrowdSecHttpContext {
 
         log::info!("AppSec response status: {}", status);
 
-        if status == 503 {
-            log::error!("AppSec API unavailable");
-            if self.config.crowdsec.appsec.fail_open {
-                self.allow_and_resume();
-                return;
-            }
-            log::warn!("fail_open disabled, denying request");
+        // Async mode: request already passed through, never block
+        if self.config.crowdsec.appsec.async_mode {
+            log::info!(
+                "Async mode: AppSec result {} ignored, request already allowed",
+                status
+            );
+            self.appsec_done = true;
+            return;
         }
 
         if status == 200 {
             log::info!("AppSec allows request, resuming");
             self.allow_and_resume();
-        } else {
+        } else if status == 403 {
             log::warn!(
                 "AppSec blocking request from {} (status: {})",
                 self.ip,
@@ -164,6 +166,20 @@ impl Context for CrowdSecHttpContext {
                 vec![("content-type", "text/plain")],
                 Some(b"AppSec Access Denied"),
             );
+        } else {
+            // Any other status (401 bad api key, 500, 503, etc.) is an AppSec failure
+            log::error!("AppSec request failed with status: {}", status);
+            if self.config.crowdsec.appsec.fail_open {
+                log::info!("Fail open enabled, allowing request");
+                self.allow_and_resume();
+            } else {
+                log::warn!("Fail open disabled, denying request");
+                self.send_http_response(
+                    403,
+                    vec![("content-type", "text/plain")],
+                    Some(b"AppSec Access Denied"),
+                );
+            }
         }
     }
 }
@@ -305,7 +321,7 @@ impl HttpContext for CrowdSecHttpContext {
     }
 
     fn on_http_response_headers(&mut self, _num_headers: usize, _end_of_stream: bool) -> Action {
-        if self.appsec_pending {
+        if self.appsec_pending && !self.config.crowdsec.appsec.async_mode {
             log::info!("AppSec pending, pausing response");
             self.response_paused = true;
             return Action::Pause;

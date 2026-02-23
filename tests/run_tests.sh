@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ENVOY_URL="${ENVOY_URL:-http://localhost:8000}"
+ENVOY_ASYNC_URL="${ENVOY_ASYNC_URL:-http://localhost:8001}"
+ENVOY_FAILOPEN_URL="${ENVOY_FAILOPEN_URL:-http://localhost:8002}"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -254,6 +256,11 @@ echo ""
 assert_status "CrowdSec AppSec test probe (expect 403)" 403 \
     "$ENVOY_URL/crowdsec-test-NtktlJHV4TfBSK3wvlhiOBnl"
 
+assert_status "CrowdSec AppSec test probe (async) (expect 404)" 404 \
+    "$ENVOY_ASYNC_URL/crowdsec-test-NtktlJHV4TfBSK3wvlhiOBnl"
+
+assert_status "CrowdSec AppSec test probe (fail_open) (expect 404)" 404 \
+    "$ENVOY_FAILOPEN_URL/crowdsec-test-NtktlJHV4TfBSK3wvlhiOBnl"
 echo ""
 
 # -----------------------------------------------------------
