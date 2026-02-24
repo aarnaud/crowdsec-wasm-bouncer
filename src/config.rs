@@ -9,6 +9,11 @@ pub struct Config {
 pub struct CrowdSecConfig {
     pub lapi: LAPIConfig,
     pub appsec: AppSecConfig,
+    // IPs/CIDRs (IPv4 or IPv6 exact) of trusted reverse proxies.
+    // When the connecting address matches, the leftmost IP in X-Forwarded-For is used
+    // as the real client IP. Leave empty to always use the direct connection address.
+    #[serde(default)]
+    pub trusted_ips: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

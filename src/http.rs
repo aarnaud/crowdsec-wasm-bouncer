@@ -4,6 +4,68 @@ use std::time::Duration;
 
 use crate::config::Config;
 
+/// Strip the port suffix from an address that may be "ip:port" or "[ipv6]:port".
+fn strip_port(addr: &str) -> String {
+    if addr.starts_with('[') {
+        // Bracketed IPv6: "[::1]:8080" → "::1"
+        if let Some(close) = addr.find(']') {
+            return addr[1..close].to_string();
+        }
+    } else if addr.matches(':').count() == 1 {
+        // IPv4:port — exactly one colon means it is a port separator
+        if let Some(idx) = addr.rfind(':') {
+            return addr[..idx].to_string();
+        }
+    }
+    // Bare IPv6 (multiple colons, no brackets) or plain IP: leave unchanged
+    addr.to_string()
+}
+
+/// Parse a dotted-decimal IPv4 address into a u32.
+fn parse_ipv4(s: &str) -> Option<u32> {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let a = parts[0].parse::<u8>().ok()? as u32;
+    let b = parts[1].parse::<u8>().ok()? as u32;
+    let c = parts[2].parse::<u8>().ok()? as u32;
+    let d = parts[3].parse::<u8>().ok()? as u32;
+    Some((a << 24) | (b << 16) | (c << 8) | d)
+}
+
+/// Return true if `ip` falls within `cidr`.
+/// Supports IPv4 CIDR notation and exact IPv6 matching.
+fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
+    if let Some(slash) = cidr.find('/') {
+        let base = &cidr[..slash];
+        let prefix_len: u32 = match cidr[slash + 1..].parse() {
+            Ok(n) => n,
+            Err(_) => return false,
+        };
+        match (parse_ipv4(ip), parse_ipv4(base)) {
+            (Some(ip_u32), Some(base_u32)) => {
+                let mask = if prefix_len == 0 {
+                    0u32
+                } else if prefix_len >= 32 {
+                    !0u32
+                } else {
+                    !0u32 << (32 - prefix_len)
+                };
+                (ip_u32 & mask) == (base_u32 & mask)
+            }
+            // IPv6 CIDR: not supported, fall back to exact match of base
+            _ => ip == base,
+        }
+    } else {
+        ip == cidr
+    }
+}
+
+fn is_trusted_ip(ip: &str, trusted: &[String]) -> bool {
+    trusted.iter().any(|entry| ip_in_cidr(ip, entry))
+}
+
 pub struct CrowdSecHttpContext {
     config: Config,
     ip: String,
@@ -186,30 +248,27 @@ impl Context for CrowdSecHttpContext {
 
 impl HttpContext for CrowdSecHttpContext {
     fn on_http_request_headers(&mut self, _num_headers: usize, end_of_stream: bool) -> Action {
-        self.ip = self
-            .get_http_request_header("x-forwarded-for")
-            .or_else(|| {
-                self.get_property(vec!["source", "address"])
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-            })
+        // Resolve the direct connecting address and strip any port suffix.
+        let source_ip = self
+            .get_property(vec!["source", "address"])
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|addr| strip_port(&addr))
             .unwrap_or_default();
 
-        // source.address may return IP:port — strip the port robustly.
-        // Bracketed IPv6: "[::1]:8080" → strip brackets and ":port"
-        // IPv4 with port: "1.2.3.4:8080" → strip ":port" (exactly one colon)
-        // Bare IPv6: "::1" or "2001:db8::1" → multiple colons, no brackets, leave as-is
-        if self.ip.starts_with('[') {
-            // Bracketed IPv6: find the closing ']', discard everything after it
-            if let Some(close) = self.ip.find(']') {
-                self.ip = self.ip[1..close].to_string();
-            }
-        } else if self.ip.matches(':').count() == 1 {
-            // IPv4:port — single colon means it must be a port separator
-            if let Some(idx) = self.ip.rfind(':') {
-                self.ip = self.ip[..idx].to_string();
-            }
-        }
-        // Bare IPv6 (multiple colons, no brackets): leave unchanged
+        // Only honour X-Forwarded-For when the direct peer is a configured trusted proxy,
+        // preventing clients from spoofing their IP via that header.
+        let trusted = !self.config.crowdsec.trusted_ips.is_empty()
+            && is_trusted_ip(&source_ip, &self.config.crowdsec.trusted_ips);
+
+        self.ip = if trusted {
+            // Use the leftmost (original client) IP from XFF, falling back to source_ip.
+            self.get_http_request_header("x-forwarded-for")
+                .and_then(|xff| xff.split(',').next().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| source_ip.clone())
+        } else {
+            source_ip
+        };
 
         self.path = self.get_http_request_header(":path").unwrap_or_default();
         self.method = self.get_http_request_header(":method").unwrap_or_default();
@@ -327,5 +386,71 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Pause;
         }
         Action::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_port_ipv4_with_port() {
+        assert_eq!(strip_port("1.2.3.4:8080"), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_strip_port_ipv4_bare() {
+        assert_eq!(strip_port("1.2.3.4"), "1.2.3.4");
+    }
+
+    #[test]
+    fn test_strip_port_bracketed_ipv6() {
+        assert_eq!(strip_port("[::1]:8080"), "::1");
+        assert_eq!(strip_port("[2001:db8::1]:443"), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_strip_port_bare_ipv6() {
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn test_ip_in_cidr_ipv4_exact() {
+        assert!(ip_in_cidr("10.0.0.1", "10.0.0.1"));
+        assert!(!ip_in_cidr("10.0.0.2", "10.0.0.1"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_ipv4_cidr() {
+        assert!(ip_in_cidr("192.168.1.50", "192.168.1.0/24"));
+        assert!(ip_in_cidr("192.168.0.1", "192.168.0.0/16"));
+        assert!(!ip_in_cidr("192.169.0.1", "192.168.0.0/16"));
+        assert!(ip_in_cidr("10.0.0.1", "0.0.0.0/0"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_ipv4_slash32() {
+        assert!(ip_in_cidr("10.0.0.1", "10.0.0.1/32"));
+        assert!(!ip_in_cidr("10.0.0.2", "10.0.0.1/32"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_ipv6_exact() {
+        assert!(ip_in_cidr("::1", "::1"));
+        assert!(!ip_in_cidr("::2", "::1"));
+    }
+
+    #[test]
+    fn test_is_trusted_ip_empty_list() {
+        assert!(!is_trusted_ip("1.2.3.4", &[]));
+    }
+
+    #[test]
+    fn test_is_trusted_ip_matches() {
+        let trusted = vec!["10.0.0.0/8".to_string(), "192.168.1.100".to_string()];
+        assert!(is_trusted_ip("10.5.6.7", &trusted));
+        assert!(is_trusted_ip("192.168.1.100", &trusted));
+        assert!(!is_trusted_ip("172.16.0.1", &trusted));
     }
 }
