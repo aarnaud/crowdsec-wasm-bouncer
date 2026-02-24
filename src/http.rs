@@ -108,6 +108,7 @@ impl CrowdSecHttpContext {
             self.body_data.truncate(pos);
         }
 
+        let body_len = self.body_data.len().to_string();
         let mut headers = vec![
             (":method", "POST"),
             (":path", "/"),
@@ -121,6 +122,7 @@ impl CrowdSecHttpContext {
                 "X-Crowdsec-Appsec-Api-Key",
                 self.config.crowdsec.appsec.key.as_str(),
             ),
+            ("Content-Length", body_len.as_str()),
         ];
         if !self.content_type.is_empty() && !self.body_data.is_empty() {
             headers.push(("Content-Type", self.content_type.as_str()));
