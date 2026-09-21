@@ -131,12 +131,14 @@ fn parse_challenge_envelope(body: &[u8]) -> Option<ChallengeEnvelope> {
     Some(envelope)
 }
 
-/// Add 'wasm-unsafe-eval' to a CSP's script-src (or default-src, if no script-src is
-/// present) directive. CrowdSec's shipped bot-detection challenge page ships a CSP
-/// whose script-src lacks it, which Firefox enforces strictly for
-/// WebAssembly.instantiate (used by the challenge's PoW module) while Chromium is
-/// more lenient - breaking the challenge only in Firefox. No config-level override
-/// exists upstream yet, so patch the header here before relaying it to the client.
+/// Add 'unsafe-eval' to a CSP's script-src (or default-src, if no script-src is
+/// present) directive. CrowdSec's shipped bot-detection challenge page calls a
+/// plain JS eval()/Function() (not just WebAssembly.instantiate - 'wasm-unsafe-eval'
+/// alone is not enough, confirmed by Firefox's own "Missing 'unsafe-eval'" console
+/// message) without allowing it in its own CSP. Firefox enforces this strictly while
+/// Chromium is more lenient, breaking the challenge only in Firefox. No config-level
+/// override exists upstream yet, so patch the header here before relaying it to the
+/// client.
 fn patch_csp_for_wasm(value: &str) -> String {
     let directives: Vec<&str> = value
         .split(';')
@@ -159,8 +161,8 @@ fn patch_csp_for_wasm(value: &str) -> String {
     directives
         .into_iter()
         .map(|d| {
-            if d.split_whitespace().next() == Some(target) && !d.contains("unsafe-eval") {
-                format!("{d} 'wasm-unsafe-eval'")
+            if d.split_whitespace().next() == Some(target) && !d.contains("'unsafe-eval'") {
+                format!("{d} 'unsafe-eval'")
             } else {
                 d.to_string()
             }
@@ -790,7 +792,7 @@ mod tests {
         let patched = patch_csp_for_wasm(csp);
         assert_eq!(
             patched,
-            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self'"
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self'"
         );
     }
 
@@ -800,7 +802,7 @@ mod tests {
         let patched = patch_csp_for_wasm(csp);
         assert_eq!(
             patched,
-            "default-src 'self' 'wasm-unsafe-eval'; style-src 'self'"
+            "default-src 'self' 'unsafe-eval'; style-src 'self'"
         );
     }
 
@@ -808,9 +810,19 @@ mod tests {
     fn test_patch_csp_for_wasm_noop_when_already_allowed() {
         let csp = "script-src 'self' 'unsafe-eval'";
         assert_eq!(patch_csp_for_wasm(csp), csp);
+    }
 
-        let csp_wasm = "script-src 'self' 'wasm-unsafe-eval'";
-        assert_eq!(patch_csp_for_wasm(csp_wasm), csp_wasm);
+    #[test]
+    fn test_patch_csp_for_wasm_upgrades_wasm_only_eval() {
+        // 'wasm-unsafe-eval' alone only covers WebAssembly.instantiate, not plain
+        // eval()/Function() - confirmed by Firefox's own "Missing 'unsafe-eval'"
+        // console message when only 'wasm-unsafe-eval' was present. Must still add
+        // the broader 'unsafe-eval'.
+        let csp = "script-src 'self' 'wasm-unsafe-eval'";
+        assert_eq!(
+            patch_csp_for_wasm(csp),
+            "script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'"
+        );
     }
 
     #[test]
@@ -826,7 +838,7 @@ mod tests {
         let patched = patch_csp_for_wasm(csp);
         assert_eq!(
             patched,
-            "script-src-elem 'self'; default-src 'self' 'wasm-unsafe-eval'"
+            "script-src-elem 'self'; default-src 'self' 'unsafe-eval'"
         );
     }
 
@@ -849,7 +861,7 @@ mod tests {
             headers,
             vec![(
                 "Content-Security-Policy".to_string(),
-                "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'".to_string()
+                "script-src 'self' 'unsafe-inline' 'unsafe-eval'".to_string()
             )]
         );
     }
