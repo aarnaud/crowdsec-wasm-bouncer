@@ -43,6 +43,11 @@ pub struct AppSecConfig {
     pub forward_body: bool,
     #[serde(default = "default_max_body_size_kb")]
     pub max_body_size_kb: u32,
+    // Cap on the AppSec 403-response body (challenge/ban envelope) read per call.
+    // Bot-detection challenge pages embed a PoW/fingerprint script and can run to
+    // several hundred KiB; too low a value falls back to a classic flat block.
+    #[serde(default = "default_max_response_body_size_kb")]
+    pub max_response_body_size_kb: u32,
 }
 
 fn default_sync_freq() -> u32 {
@@ -55,4 +60,8 @@ fn default_true() -> bool {
 
 fn default_max_body_size_kb() -> u32 {
     8
+}
+
+fn default_max_response_body_size_kb() -> u32 {
+    1024
 }

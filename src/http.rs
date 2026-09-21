@@ -147,11 +147,6 @@ fn build_challenge_headers(envelope: &ChallengeEnvelope) -> Vec<(String, String)
     headers
 }
 
-/// Hard cap on the AppSec 403-response body (challenge/ban envelope) read per call.
-/// Bounds memory against a slow/compromised/misrouted AppSec claiming a huge
-/// body_size; exceeding it falls back to the classic block response (still 403).
-const MAX_APPSEC_RESPONSE_BODY_SIZE: usize = 256 * 1024;
-
 pub struct CrowdSecHttpContext {
     config: Config,
     ip: String,
@@ -260,6 +255,10 @@ impl CrowdSecHttpContext {
         (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024
     }
 
+    fn max_response_body_size(&self) -> usize {
+        (self.config.crowdsec.appsec.max_response_body_size_kb as usize) * 1024
+    }
+
     fn request_has_body(&self) -> bool {
         self.config.crowdsec.appsec.forward_body
             && matches!(self.method.as_str(), "POST" | "PUT" | "PATCH")
@@ -303,13 +302,14 @@ impl Context for CrowdSecHttpContext {
             log::info!("AppSec allows request, resuming");
             self.allow_and_resume();
         } else if status == 403 {
+            let max_response_size = self.max_response_body_size();
             let body = if body_size == 0 {
                 None
-            } else if body_size > MAX_APPSEC_RESPONSE_BODY_SIZE {
+            } else if body_size > max_response_size {
                 log::error!(
                     "AppSec response body too large ({} bytes, max {}), falling back to classic block",
                     body_size,
-                    MAX_APPSEC_RESPONSE_BODY_SIZE
+                    max_response_size
                 );
                 None
             } else {
