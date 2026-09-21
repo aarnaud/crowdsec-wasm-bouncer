@@ -131,6 +131,44 @@ fn parse_challenge_envelope(body: &[u8]) -> Option<ChallengeEnvelope> {
     Some(envelope)
 }
 
+/// Add 'wasm-unsafe-eval' to a CSP's script-src (or default-src, if no script-src is
+/// present) directive. CrowdSec's shipped bot-detection challenge page ships a CSP
+/// whose script-src lacks it, which Firefox enforces strictly for
+/// WebAssembly.instantiate (used by the challenge's PoW module) while Chromium is
+/// more lenient - breaking the challenge only in Firefox. No config-level override
+/// exists upstream yet, so patch the header here before relaying it to the client.
+fn patch_csp_for_wasm(value: &str) -> String {
+    let directives: Vec<&str> = value
+        .split(';')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let target = if directives
+        .iter()
+        .any(|d| d.split_whitespace().next() == Some("script-src"))
+    {
+        "script-src"
+    } else if directives
+        .iter()
+        .any(|d| d.split_whitespace().next() == Some("default-src"))
+    {
+        "default-src"
+    } else {
+        return value.to_string();
+    };
+    directives
+        .into_iter()
+        .map(|d| {
+            if d.split_whitespace().next() == Some(target) && !d.contains("unsafe-eval") {
+                format!("{d} 'wasm-unsafe-eval'")
+            } else {
+                d.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Flatten a challenge envelope's user_headers and user_cookies into (name, value) pairs
 /// for send_http_response. Each user_headers value list becomes one header per entry;
 /// each user_cookies entry becomes one set-cookie header.
@@ -138,7 +176,11 @@ fn build_challenge_headers(envelope: &ChallengeEnvelope) -> Vec<(String, String)
     let mut headers = Vec::new();
     for (name, values) in &envelope.user_headers {
         for value in values {
-            headers.push((name.clone(), value.clone()));
+            if name.eq_ignore_ascii_case("content-security-policy") {
+                headers.push((name.clone(), patch_csp_for_wasm(value)));
+            } else {
+                headers.push((name.clone(), value.clone()));
+            }
         }
     }
     for cookie in &envelope.user_cookies {
@@ -740,5 +782,75 @@ mod tests {
             user_cookies: vec![],
         };
         assert!(build_challenge_headers(&envelope).is_empty());
+    }
+
+    #[test]
+    fn test_patch_csp_for_wasm_adds_to_script_src() {
+        let csp = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self'";
+        let patched = patch_csp_for_wasm(csp);
+        assert_eq!(
+            patched,
+            "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self'"
+        );
+    }
+
+    #[test]
+    fn test_patch_csp_for_wasm_falls_back_to_default_src() {
+        let csp = "default-src 'self'; style-src 'self'";
+        let patched = patch_csp_for_wasm(csp);
+        assert_eq!(
+            patched,
+            "default-src 'self' 'wasm-unsafe-eval'; style-src 'self'"
+        );
+    }
+
+    #[test]
+    fn test_patch_csp_for_wasm_noop_when_already_allowed() {
+        let csp = "script-src 'self' 'unsafe-eval'";
+        assert_eq!(patch_csp_for_wasm(csp), csp);
+
+        let csp_wasm = "script-src 'self' 'wasm-unsafe-eval'";
+        assert_eq!(patch_csp_for_wasm(csp_wasm), csp_wasm);
+    }
+
+    #[test]
+    fn test_patch_csp_for_wasm_noop_when_no_relevant_directive() {
+        let csp = "img-src 'self' data:";
+        assert_eq!(patch_csp_for_wasm(csp), csp);
+    }
+
+    #[test]
+    fn test_patch_csp_for_wasm_ignores_script_src_elem_prefix_collision() {
+        // "script-src-elem" must not be mistaken for "script-src" by a naive prefix check.
+        let csp = "script-src-elem 'self'; default-src 'self'";
+        let patched = patch_csp_for_wasm(csp);
+        assert_eq!(
+            patched,
+            "script-src-elem 'self'; default-src 'self' 'wasm-unsafe-eval'"
+        );
+    }
+
+    #[test]
+    fn test_build_challenge_headers_patches_csp() {
+        let mut user_headers = HashMap::new();
+        user_headers.insert(
+            "Content-Security-Policy".to_string(),
+            vec!["script-src 'self' 'unsafe-inline'".to_string()],
+        );
+        let envelope = ChallengeEnvelope {
+            action: "challenge".to_string(),
+            http_status: 200,
+            user_body_content: String::new(),
+            user_headers,
+            user_cookies: vec![],
+        };
+        let headers = build_challenge_headers(&envelope);
+        assert_eq!(
+            headers,
+            vec![(
+                "Content-Security-Policy".to_string(),
+                "script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'".to_string()
+            )]
+        );
     }
 }
