@@ -539,23 +539,22 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // Re-read whatever the host currently has buffered on every call, rather
-        // than tracking an incremental offset or deferring the read to dispatch
-        // time: this filter always returns Action::Continue for body chunks (so
-        // real traffic isn't held up waiting on AppSec), and the host is free to
-        // forward-and-drop a chunk once we do - later calls can arrive with
-        // body_size=0 (a trailing end_of_stream signal after the real data was
-        // already delivered), and by then it's too late to fetch it. Capturing
-        // on every non-empty call, and leaving body_data untouched on empty
-        // calls, is the only approach that's correct under both a growing
-        // cumulative buffer and a drain-after-Continue host.
+        // This filter always returns Action::Continue for body chunks (so real
+        // traffic isn't held up waiting on AppSec), and the host drains/forwards
+        // each chunk once we do: body_size on each call is the size of the newly
+        // arrived, not-yet-consumed chunk, not a cumulative total (confirmed
+        // directly - under HTTP/2, each DATA frame reports only its own size).
+        // So each call's readable region is a fresh chunk starting at its own
+        // offset 0, and must be appended, not used to replace what's already
+        // been accumulated.
         let max_size = self.max_body_size();
-        let read_len = body_size.min(max_size);
+        let remaining = max_size.saturating_sub(self.body_data.len());
+        let read_len = body_size.min(remaining);
         if read_len > 0 {
             match self.get_http_request_body(0, read_len) {
-                Some(body) => {
-                    log::debug!("Buffered {} bytes of body", body.len());
-                    self.body_data = body;
+                Some(chunk) => {
+                    log::debug!("Buffered {} more bytes of body", chunk.len());
+                    self.body_data.extend_from_slice(&chunk);
                 }
                 None => log::warn!("get_http_request_body(0, {}) returned None", read_len),
             }
