@@ -494,9 +494,12 @@ impl HttpContext for CrowdSecHttpContext {
             }
             // Body arrived with headers (end_of_stream=true): read it now
             let max_size = self.max_body_size();
-            if let Some(body) = self.get_http_request_body(0, max_size) {
-                log::info!("Read {} bytes of body at headers", body.len());
-                self.body_data = body;
+            match self.get_http_request_body(0, max_size) {
+                Some(body) => {
+                    log::info!("Read {} bytes of body at headers", body.len());
+                    self.body_data = body;
+                }
+                None => log::warn!("get_http_request_body(0, {}) returned None", max_size),
             }
         }
 
@@ -536,16 +539,25 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // Accumulate body up to max_body_size_kb
+        // Re-read whatever the host currently has buffered on every call, rather
+        // than tracking an incremental offset or deferring the read to dispatch
+        // time: this filter always returns Action::Continue for body chunks (so
+        // real traffic isn't held up waiting on AppSec), and the host is free to
+        // forward-and-drop a chunk once we do - later calls can arrive with
+        // body_size=0 (a trailing end_of_stream signal after the real data was
+        // already delivered), and by then it's too late to fetch it. Capturing
+        // on every non-empty call, and leaving body_data untouched on empty
+        // calls, is the only approach that's correct under both a growing
+        // cumulative buffer and a drain-after-Continue host.
         let max_size = self.max_body_size();
-        if body_size > 0 && self.body_data.len() < max_size {
-            let offset = self.body_data.len();
-            let read_size = body_size.saturating_sub(offset).min(max_size - offset);
-            if read_size > 0 {
-                if let Some(chunk) = self.get_http_request_body(offset, read_size) {
-                    self.body_data.extend_from_slice(&chunk);
-                    log::debug!("Buffered {} bytes of body", self.body_data.len());
+        let read_len = body_size.min(max_size);
+        if read_len > 0 {
+            match self.get_http_request_body(0, read_len) {
+                Some(body) => {
+                    log::debug!("Buffered {} bytes of body", body.len());
+                    self.body_data = body;
                 }
+                None => log::warn!("get_http_request_body(0, {}) returned None", read_len),
             }
         }
 
