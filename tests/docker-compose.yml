@@ -67,6 +67,21 @@ services:
       crowdsec:
         condition: service_healthy
 
+  envoy-lapi:
+    image: envoyproxy/envoy:v1.36-latest
+    ports:
+      - "8003:8000"
+      - "9904:9901"
+    volumes:
+      - ./envoy-lapi.yaml:/etc/envoy/envoy.yaml
+      - ../target/wasm32-wasip1/release/crowdsec_wasm_bouncer.wasm:/etc/envoy/plugin.wasm
+    environment:
+      CROWDSEC_LAPI_KEY: "test-bouncer-key"
+      CROWDSEC_APPSEC_KEY: "test-bouncer-key"
+    depends_on:
+      crowdsec:
+        condition: service_healthy
+
 volumes:
   crowdsec-db:
   crowdsec-config:

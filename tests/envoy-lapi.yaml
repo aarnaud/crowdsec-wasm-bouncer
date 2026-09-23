@@ -49,17 +49,20 @@ static_resources:
                               {
                                 "crowdsec": {
                                   "lapi": {
-                                    "enabled": false,
+                                    "enabled": true,
                                     "cluster": "crowdsec_lapi",
-                                    "sync_freq": 10
+                                    "sync_freq": 5
                                   },
                                   "appsec": {
-                                    "enabled": true,
-                                    "async_mode": false,
-                                    "cluster": "crowdsec_appsec",
-                                    "forward_body": true,
-                                    "max_body_size_kb": 64
-                                  }
+                                    "enabled": false,
+                                    "cluster": "crowdsec_appsec"
+                                  },
+                                  "trusted_ips": [
+                                    "10.0.0.0/8",
+                                    "172.16.0.0/12",
+                                    "192.168.0.0/16",
+                                    "127.0.0.0/8"
+                                  ]
                                 }
                               }
                   - name: envoy.filters.http.router

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::http::CrowdSecHttpContext;
+use crate::http::{encode_range, RANGES_V4_KEY, RANGES_V6_KEY, RANGE_V4_RECORD, RANGE_V6_RECORD};
 
 #[derive(Deserialize)]
 struct DecisionsResponse {
@@ -27,6 +28,10 @@ struct Decision {
 /// Bounds memory against a slow/compromised/misrouted LAPI claiming a huge
 /// body_size, while staying well above realistic blocklist sizes.
 const MAX_LAPI_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
+
+/// Cap on stored Range decisions per address family. Each one is scanned on every
+/// request, so this bounds both shared-data memory and the per-request match cost.
+const MAX_RANGE_DECISIONS: usize = 4096;
 
 pub struct CrowdSecPlugin {
     config: Option<Config>,
@@ -103,6 +108,45 @@ impl CrowdSecPlugin {
             }
         }
     }
+
+    /// Apply additions and removals to a packed range blob in shared data. Records are
+    /// fixed-width, so add/remove is a byte-slice comparison with no parsing.
+    fn update_range_blob(
+        &self,
+        key: &str,
+        record_size: usize,
+        add: &[Vec<u8>],
+        remove: &[Vec<u8>],
+    ) {
+        if add.is_empty() && remove.is_empty() {
+            return;
+        }
+        let (existing, cas) = self.get_shared_data(key);
+        let existing = existing.unwrap_or_default();
+        let mut records: Vec<&[u8]> = existing.chunks_exact(record_size).collect();
+        records.retain(|r| !remove.iter().any(|d| d.as_slice() == *r));
+        for r in add {
+            if records.contains(&r.as_slice()) {
+                continue;
+            }
+            if records.len() >= MAX_RANGE_DECISIONS {
+                log::error!(
+                    "Range decision cap ({}) reached for {}, dropping further ranges",
+                    MAX_RANGE_DECISIONS,
+                    key
+                );
+                break;
+            }
+            records.push(r.as_slice());
+        }
+        let blob: Vec<u8> = records.concat();
+        let count = blob.len() / record_size;
+        if self.set_shared_data(key, Some(&blob), cas).is_err() {
+            log::error!("Failed to update range blob {} (CAS conflict)", key);
+        } else {
+            log::info!("Range blob {} now holds {} entries", key, count);
+        }
+    }
 }
 
 impl Context for CrowdSecPlugin {
@@ -169,21 +213,73 @@ impl Context for CrowdSecPlugin {
         let new = resp.new.unwrap_or_default();
         let deleted = resp.deleted.unwrap_or_default();
 
-        // Update shared data
+        let mut v4_add = Vec::new();
+        let mut v6_add = Vec::new();
+        let mut v4_remove = Vec::new();
+        let mut v6_remove = Vec::new();
+        let mut applied = 0;
+
         for d in &new {
-            let key = format!("{}:{}", d.scope.to_lowercase(), d.value);
-            let value = format!("{}_{}", d.decision_type, d.scenario);
-            let _ = self.set_shared_data(&key, Some(value.as_bytes()), None);
+            // Only "ban" is enforceable here. A captcha decision has no challenge flow on
+            // this path and any other type is unknown, so storing them would turn them
+            // into silent hard blocks.
+            if !d.decision_type.eq_ignore_ascii_case("ban") {
+                log::info!(
+                    "Ignoring unsupported decision type {} for {}",
+                    d.decision_type,
+                    d.value
+                );
+                continue;
+            }
+            match d.scope.to_lowercase().as_str() {
+                "ip" => {
+                    let key = format!("ip:{}", d.value);
+                    let value = format!("{}_{}", d.decision_type, d.scenario);
+                    let _ = self.set_shared_data(&key, Some(value.as_bytes()), None);
+                    applied += 1;
+                }
+                "range" => match encode_range(&d.value) {
+                    Some((true, record)) => {
+                        v6_add.push(record);
+                        applied += 1;
+                    }
+                    Some((false, record)) => {
+                        v4_add.push(record);
+                        applied += 1;
+                    }
+                    None => log::warn!("Skipping unparseable range decision: {}", d.value),
+                },
+                other => log::info!(
+                    "Ignoring decision with unsupported scope {} for {}",
+                    other,
+                    d.value
+                ),
+            }
         }
 
+        // Removals apply regardless of type: whatever the decision was, it is over.
         for d in &deleted {
-            let key = format!("{}:{}", d.scope.to_lowercase(), d.value);
-            let _ = self.set_shared_data(&key, None, None);
+            match d.scope.to_lowercase().as_str() {
+                "ip" => {
+                    let key = format!("ip:{}", d.value);
+                    let _ = self.set_shared_data(&key, None, None);
+                }
+                "range" => match encode_range(&d.value) {
+                    Some((true, record)) => v6_remove.push(record),
+                    Some((false, record)) => v4_remove.push(record),
+                    None => {}
+                },
+                _ => {}
+            }
         }
+
+        self.update_range_blob(RANGES_V4_KEY, RANGE_V4_RECORD, &v4_add, &v4_remove);
+        self.update_range_blob(RANGES_V6_KEY, RANGE_V6_RECORD, &v6_add, &v6_remove);
 
         log::info!(
-            "Synced decisions: +{} new, -{} deleted",
+            "Synced decisions: +{} new ({} applied), -{} deleted",
             new.len(),
+            applied,
             deleted.len()
         );
     }
@@ -206,6 +302,20 @@ impl RootContext for CrowdSecPlugin {
                                 config.crowdsec.appsec.key = key;
                             }
                         }
+
+                        // Drop unusable trusted_ips entries rather than carrying them
+                        // into the trust check: an empty or unparseable entry can match
+                        // an odd source address and hand X-Forwarded-For control to an
+                        // untrusted peer. Dropping one only means XFF stops being
+                        // honoured for that proxy, which fails closed.
+                        config.crowdsec.trusted_ips.retain(|entry| {
+                            let valid = encode_range(entry).is_some();
+                            if !valid {
+                                log::error!("Ignoring invalid trusted_ips entry: {:?}", entry);
+                            }
+                            valid
+                        });
+
                         log::warn!(
                             "CrowdSec Plugin loading:\n\
                             \tLAPI cluster: {}\n\
@@ -215,7 +325,8 @@ impl RootContext for CrowdSecPlugin {
                             \tAppsec enabled: {}\n\
                             \tAppsec FailOpen: {}\n\
                             \tAppsec ForwardBody: {}\n\
-                            \tAppsec MaxBodySizeKB: {}\n",
+                            \tAppsec MaxBodySizeKB: {}\n\
+                            \tTrustedIPs: {}\n",
                             config.crowdsec.lapi.cluster,
                             config.crowdsec.lapi.enabled,
                             config.crowdsec.lapi.sync_freq,
@@ -224,11 +335,12 @@ impl RootContext for CrowdSecPlugin {
                             config.crowdsec.appsec.fail_open,
                             config.crowdsec.appsec.forward_body,
                             config.crowdsec.appsec.max_body_size_kb,
+                            config.crowdsec.trusted_ips.join(", "),
                         );
 
                         // Schedule periodic sync
-                        let sync_millis = config.crowdsec.lapi.sync_freq * 1000;
-                        self.set_tick_period(Duration::from_millis(sync_millis as u64));
+                        let sync_millis = (config.crowdsec.lapi.sync_freq as u64) * 1000;
+                        self.set_tick_period(Duration::from_millis(sync_millis));
 
                         self.config = Some(config);
                         true
