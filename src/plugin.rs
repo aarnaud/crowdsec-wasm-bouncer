@@ -2,6 +2,7 @@ use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::Deserialize;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 use crate::config::Config;
 use crate::http::CrowdSecHttpContext;
@@ -33,6 +34,22 @@ const MAX_LAPI_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
 /// request, so this bounds both shared-data memory and the per-request match cost.
 const MAX_RANGE_DECISIONS: usize = 4096;
 
+/// How long a held sync lock may go unreleased before another worker steals it.
+/// The lock is released in on_http_call_response, so it only outlives its holder when
+/// that callback never arrives (VM recycled, worker torn down mid-flight). Without a
+/// steal path the lock would persist in shared data forever and decision syncing would
+/// stop permanently: bans go stale and `deleted` entries are never removed. Twice the
+/// 60s LAPI dispatch timeout, so a genuinely in-flight sync is never interrupted.
+const SYNC_LOCK_STALE_MS: u64 = 120_000;
+
+/// Read the epoch-millis timestamp out of a sync lock value. Returns None for anything
+/// that is not one (including the old fixed `b"locked"` value), which is treated as
+/// stale so an upgrade cannot inherit a permanently wedged lock.
+fn parse_lock_timestamp(data: &[u8]) -> Option<u64> {
+    let bytes: [u8; 8] = data.try_into().ok()?;
+    Some(u64::from_be_bytes(bytes))
+}
+
 pub struct CrowdSecPlugin {
     config: Option<Config>,
     first_sync: bool,
@@ -61,16 +78,31 @@ impl CrowdSecPlugin {
 
         // Try to acquire lock atomically
         let (lock_data, cas) = self.get_shared_data(sync_lock_key);
+        let now = self
+            .get_current_time()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         if let Some(data) = lock_data {
             if !data.is_empty() {
-                log::debug!("Sync already in progress, skipping");
-                return;
+                match parse_lock_timestamp(&data) {
+                    Some(held_since) if now.saturating_sub(held_since) < SYNC_LOCK_STALE_MS => {
+                        log::debug!("Sync already in progress, skipping");
+                        return;
+                    }
+                    Some(held_since) => log::warn!(
+                        "Sync lock held for {}ms with no release, stealing it",
+                        now.saturating_sub(held_since)
+                    ),
+                    None => log::warn!("Sync lock value is not a timestamp, stealing it"),
+                }
             }
         }
 
-        // Try to set lock with CAS - only one thread will succeed
+        // Try to set lock with CAS - only one thread will succeed. The CAS also settles
+        // the race when several workers spot the same stale lock at once.
         if self
-            .set_shared_data(sync_lock_key, Some(&b"locked"[..]), cas)
+            .set_shared_data(sync_lock_key, Some(&now.to_be_bytes()), cas)
             .is_err()
         {
             log::debug!("Failed to acquire sync lock, another thread won");
@@ -315,6 +347,52 @@ impl RootContext for CrowdSecPlugin {
                             }
                             valid
                         });
+
+                        // Refuse to load on a configuration that cannot work. Left to run,
+                        // an enabled feature with no cluster or key fails every dispatch,
+                        // which means either a total outage (fail_open: false) or a
+                        // silently disabled WAF (fail_open: true) - both discovered in
+                        // production rather than at deploy time.
+                        if config.crowdsec.lapi.enabled {
+                            if config.crowdsec.lapi.cluster.is_empty() {
+                                log::error!("lapi.enabled is true but lapi.cluster is empty");
+                                return false;
+                            }
+                            if config.crowdsec.lapi.key.is_empty() {
+                                log::error!(
+                                    "lapi.enabled is true but no API key was given in config or CROWDSEC_LAPI_KEY"
+                                );
+                                return false;
+                            }
+                            if config.crowdsec.lapi.sync_freq == 0 {
+                                // set_tick_period(0) disables the tick outright, so the
+                                // plugin would load, log success and never sync a decision
+                                log::error!("lapi.sync_freq must be greater than 0");
+                                return false;
+                            }
+                        }
+                        if config.crowdsec.appsec.enabled {
+                            if config.crowdsec.appsec.cluster.is_empty() {
+                                log::error!("appsec.enabled is true but appsec.cluster is empty");
+                                return false;
+                            }
+                            if config.crowdsec.appsec.key.is_empty() {
+                                log::error!(
+                                    "appsec.enabled is true but no API key was given in config or CROWDSEC_APPSEC_KEY"
+                                );
+                                return false;
+                            }
+                            if config.crowdsec.appsec.forward_body
+                                && config.crowdsec.appsec.max_body_size_kb == 0
+                            {
+                                // Would dispatch immediately with an empty body, i.e.
+                                // forward_body silently does nothing
+                                log::error!(
+                                    "appsec.forward_body is true but appsec.max_body_size_kb is 0"
+                                );
+                                return false;
+                            }
+                        }
 
                         log::warn!(
                             "CrowdSec Plugin loading:\n\

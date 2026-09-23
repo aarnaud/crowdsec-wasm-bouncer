@@ -63,6 +63,29 @@ rules matching on `Referer`, `Origin`, `Cookie` or custom headers work. Client-s
 override the API key, IP, URI or verb the WAF evaluates. Framing and hop-by-hop headers
 are dropped. The relayed set is capped at 8 KiB.
 
+### Challenge responses
+
+When AppSec returns a bot-detection challenge, its status code is clamped to the 100-599
+range and its headers are restricted to an allowlist (content-type, CSP, cache-control,
+set-cookie and similar). AppSec is a semi-trusted network peer and `send_http_response`
+relays whatever it is handed, so arbitrary header names and out-of-range statuses are not
+passed through to the client.
+
+The challenge page's CSP is patched to add `'unsafe-eval'`, which CrowdSec's shipped
+challenge script needs and its own CSP omits. When the policy has no `script-src`, a
+`script-src` is derived from `default-src` rather than adding `'unsafe-eval'` to
+`default-src` itself, so directives that inherit from it (images, styles, connect,
+frames) are not widened along with scripts.
+
+### Configuration is validated at load
+
+The filter refuses to load rather than starting in a state that cannot work: an enabled
+feature with no cluster or no API key, `lapi.sync_freq: 0` (which disables the sync tick
+outright), or `forward_body: true` with `max_body_size_kb: 0`. Left to run, these fail
+every dispatch, which means either a total outage under `fail_open: false` or a silently
+disabled WAF under `fail_open: true` — both discovered in production instead of at deploy
+time. Check the proxy log on startup if the filter does not come up.
+
 ### Decisions
 
 `Ip` and `Range` scoped `ban` decisions are enforced. Other scopes (`Country`, `AS`) and
