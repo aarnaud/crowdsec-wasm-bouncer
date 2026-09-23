@@ -82,6 +82,28 @@ services:
       crowdsec:
         condition: service_healthy
 
+  slow-appsec:
+    image: python:3-alpine
+    command: python3 -u /slow_appsec.py
+    environment:
+      APPSEC_DELAY_MS: "800"
+    volumes:
+      - ./slow_appsec.py:/slow_appsec.py:ro
+
+  envoy-slowappsec:
+    image: envoyproxy/envoy:v1.36-latest
+    ports:
+      - "8004:8000"
+      - "9905:9901"
+    volumes:
+      - ./envoy-slowappsec.yaml:/etc/envoy/envoy.yaml
+      - ../target/wasm32-wasip1/release/crowdsec_wasm_bouncer.wasm:/etc/envoy/plugin.wasm
+    environment:
+      CROWDSEC_LAPI_KEY: "test-bouncer-key"
+      CROWDSEC_APPSEC_KEY: "test-bouncer-key"
+    depends_on:
+      - slow-appsec
+
 volumes:
   crowdsec-db:
   crowdsec-config:

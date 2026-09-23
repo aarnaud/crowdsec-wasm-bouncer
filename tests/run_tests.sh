@@ -5,6 +5,7 @@ ENVOY_URL="${ENVOY_URL:-http://localhost:8000}"
 ENVOY_ASYNC_URL="${ENVOY_ASYNC_URL:-http://localhost:8001}"
 ENVOY_FAILOPEN_URL="${ENVOY_FAILOPEN_URL:-http://localhost:8002}"
 ENVOY_LAPI_URL="${ENVOY_LAPI_URL:-http://localhost:8003}"
+ENVOY_SLOW_URL="${ENVOY_SLOW_URL:-http://localhost:8004}"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -89,6 +90,29 @@ assert_trailer_status() {
         PASS=$((PASS + 1))
     else
         echo -e "${RED}FAIL${NC} [$status expected $expected] $description"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# Asserts a marker appears in a service's log. Used to prove a test actually exercised
+# the code path it claims to, rather than passing for an unrelated reason.
+assert_log_contains() {
+    local description="$1"
+    local service="$2"
+    local needle="$3"
+    TOTAL=$((TOTAL + 1))
+
+    # Capture first and match with a bash builtin rather than piping into grep -q:
+    # under `set -o pipefail` grep -q exits on the first match, SIGPIPEs docker compose,
+    # and that non-zero exit poisons the pipeline into a false negative.
+    local logs
+    logs=$(docker compose logs "$service" 2>/dev/null || true)
+
+    if [[ "$logs" == *"$needle"* ]]; then
+        echo -e "${GREEN}PASS${NC} [log] $description"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}FAIL${NC} [log] $description"
         FAIL=$((FAIL + 1))
     fi
 }
@@ -497,6 +521,55 @@ else
         "$ENVOY_LAPI_URL/get"
 
     cscli decisions delete --all
+fi
+echo ""
+
+# -----------------------------------------------------------
+# Late verdict: a local reply must beat an in-flight upstream response
+# -----------------------------------------------------------
+# For a request with a streamed body the filter forwards it upstream while the AppSec
+# call is in flight and blocks by calling send_http_response during response encoding.
+# That is the only enforcement path such a request has, and it is normally untested
+# because AppSec and the origin answer within the same millisecond. envoy-slowappsec
+# points at a stand-in that sleeps 800ms, which guarantees the origin responds first.
+#
+# Transfer-Encoding: chunked is what makes the body stream: with a plain Content-Length
+# body Envoy can hand the filter headers and body together, the filter pauses at headers,
+# and the request never reaches the origin at all - which would not exercise this path.
+echo -e "${YELLOW}=== Late AppSec Verdict vs In-Flight Response ===${NC}"
+echo ""
+
+slow_ready=0
+for i in $(seq 1 60); do
+    if curl -sf -o /dev/null -m 5 "$ENVOY_SLOW_URL/get" 2>/dev/null; then
+        slow_ready=1
+        break
+    fi
+    sleep 2
+done
+if [ "$slow_ready" = "0" ]; then
+    echo -e "${RED}envoy-slowappsec did not become ready, skipping.${NC}"
+else
+    # The origin echoes the marker. If the client ever sees it on a blocked request, the
+    # local reply lost the race and the backend's response was served instead.
+    assert_body "Late block is enforced, origin response not served" 403 0 "M9ORIGINMARKER" \
+        -X POST "$ENVOY_SLOW_URL/post?block=1" \
+        -H "Transfer-Encoding: chunked" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "x=M9ORIGINMARKER"
+
+    # Control: proves the pause/resume path returns the real response rather than the
+    # suite simply failing everything closed
+    assert_body "Late allow resumes the real origin response" 200 1 "M9ORIGINMARKER" \
+        -X POST "$ENVOY_SLOW_URL/post" \
+        -H "Transfer-Encoding: chunked" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        -d "x=M9ORIGINMARKER"
+
+    # Without this the two assertions above could both pass while the response was never
+    # paused at all, making them a test of nothing
+    assert_log_contains "Response pause path was actually exercised" \
+        envoy-slowappsec "pausing response"
 fi
 echo ""
 
