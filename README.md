@@ -9,6 +9,67 @@ Proxy-WASM filter for CrowdSec integration with LAPI stream and AppSec support.
 - **AppSec**: Async/Sync event reporting (non-blocking or blocking) (configurable)
 - **IP blocking**: Checks decisions on each request (configurable)
 
+## Security Model and Limitations
+
+Read this before relying on the filter as a preventive control.
+
+### Request bodies are inspected, but a block stops the response — not the request
+
+For a request whose body is streamed (essentially every HTTP/1.1 chunked and HTTP/2
+request body), the filter forwards headers and body chunks upstream while the AppSec
+call is in flight, and blocks by suppressing the **response**. The origin has therefore
+already received and processed the request by the time a 403 is returned.
+
+This is deliberate. Proxy-WASM exposes no backpressure to the downstream connection, so
+pausing a request mid-upload just accumulates data in Envoy's connection buffer until it
+exceeds `per_connection_buffer_limit_bytes` and the client gets a 413.
+
+**Do not assume a 403 means the origin never saw the request.** Requests with side
+effects (writes, uploads, anything non-idempotent) still reach the backend. Requests
+whose body arrives with the headers, and all header-only checks, are blocked before the
+request is forwarded.
+
+### Body inspection is capped
+
+Only the first `max_body_size_kb` of a body is sent to AppSec — a deliberate DoS control,
+since every in-flight request holds its buffer in the WASM VM's linear memory. Content
+past the cap is not inspected. Budget for `max_body_size_kb x peak concurrency` of VM
+memory when raising it.
+
+Bodies whose bytes look genuinely binary (NUL bytes or a high proportion of control
+characters) are not forwarded, to avoid false-positive bans on legitimate uploads. The
+declared `Content-Type` is only a hint: a text payload sent as `application/octet-stream`
+is still inspected, because that header is attacker-controlled.
+
+### Client IP resolution
+
+By default the direct connection address is used. `trusted_ips` (IPv4/IPv6 addresses or
+CIDRs) lists reverse proxies permitted to supply `X-Forwarded-For`. When the direct peer
+matches, the header is walked **right to left**, skipping hops that are themselves in
+`trusted_ips`, and the first untrusted hop is taken as the client.
+
+The leftmost entry is never used: it is whatever the client sent, so trusting it would
+let any client behind a trusted proxy pick its own IP and bypass both the LAPI blocklist
+and AppSec's IP-scoped rules. Set `trusted_ips` to your proxies only, never `0.0.0.0/0`.
+
+If the source address cannot be resolved at all, the request is failed according to
+`appsec.fail_open` rather than continuing with an empty identity.
+
+### What reaches AppSec
+
+The client's request headers are relayed alongside the `X-Crowdsec-Appsec-*` metadata, so
+rules matching on `Referer`, `Origin`, `Cookie` or custom headers work. Client-supplied
+`X-Crowdsec-Appsec-*` headers are stripped before relaying — otherwise a client could
+override the API key, IP, URI or verb the WAF evaluates. Framing and hop-by-hop headers
+are dropped. The relayed set is capped at 8 KiB.
+
+### Decisions
+
+`Ip` and `Range` scoped `ban` decisions are enforced. Other scopes (`Country`, `AS`) and
+other decision types (including `captcha`) are synced-but-ignored rather than treated as
+hard blocks, and are logged when seen. Range decisions are capped at 4096 per address
+family.
+
 ## Project Structure
 
 - `lib.rs` - Main entry point and exports
@@ -43,7 +104,8 @@ Edit `config.json` or inline in `envoy.yaml`:
         "cluster": "crowdsec_appsec",
         "forward_body": true,
         "max_body_size_kb": 8
-      }
+      },
+      "trusted_ips": []
     }
 }
 ```
@@ -131,6 +193,8 @@ spec:
             fail_open: false
             forward_body: true
             max_body_size_kb: 8
+          # Reverse proxies allowed to supply X-Forwarded-For. Your proxies only.
+          trusted_ips: []
 ```
 
 ### Istio
@@ -199,6 +263,8 @@ spec:
         fail_open: false
         forward_body: true
         max_body_size_kb: 8
+      # Reverse proxies allowed to supply X-Forwarded-For. Your proxies only.
+      trusted_ips: []
 ```
 
 ## Architecture

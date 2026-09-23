@@ -6,6 +6,21 @@ use std::time::Duration;
 
 use crate::config::Config;
 
+/// Shared-data keys holding the packed CIDR blobs synced from LAPI `Range` decisions.
+/// Records are fixed-width big-endian (base, mask) pairs. Fixed-width packing keeps the
+/// per-request match a tight masking loop with no string parsing on the hot path.
+pub(crate) const RANGES_V4_KEY: &str = "crowdsec_ranges_v4";
+pub(crate) const RANGES_V6_KEY: &str = "crowdsec_ranges_v6";
+
+pub(crate) const RANGE_V4_RECORD: usize = 8;
+pub(crate) const RANGE_V6_RECORD: usize = 32;
+
+/// Cap on the client headers relayed to AppSec, bounding VM memory per in-flight request
+const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
+
+/// Bytes of body needed before the binary/text sniff is worth running
+const SNIFF_PREFIX: usize = 512;
+
 /// Strip the port suffix from an address that may be "ip:port" or "[ipv6]:port".
 fn strip_port(addr: &str) -> String {
     if addr.starts_with('[') {
@@ -36,43 +51,295 @@ fn parse_ipv4(s: &str) -> Option<u32> {
     Some((a << 24) | (b << 16) | (c << 8) | d)
 }
 
-/// Return true if `ip` falls within `cidr`.
-/// Supports IPv4 CIDR notation and exact IPv6 matching.
-fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
-    if let Some(slash) = cidr.find('/') {
-        let base = &cidr[..slash];
-        let prefix_len: u32 = match cidr[slash + 1..].parse() {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        match (parse_ipv4(ip), parse_ipv4(base)) {
-            (Some(ip_u32), Some(base_u32)) => {
-                let mask = if prefix_len == 0 {
-                    0u32
-                } else if prefix_len >= 32 {
-                    !0u32
-                } else {
-                    !0u32 << (32 - prefix_len)
-                };
-                (ip_u32 & mask) == (base_u32 & mask)
-            }
-            // IPv6 CIDR: not supported, fall back to exact match of base
-            _ => ip == base,
+/// Parse an IPv6 address into a u128, handling "::" compression and an embedded IPv4
+/// tail ("::ffff:192.0.2.1"). Needed so trusted_ips and Range decisions work on IPv6
+/// rather than degrading to an exact string comparison.
+fn parse_ipv6(s: &str) -> Option<u128> {
+    if s.is_empty() || !s.contains(':') {
+        return None;
+    }
+
+    fn groups(part: &str) -> Option<Vec<u16>> {
+        if part.is_empty() {
+            return Some(Vec::new());
         }
-    } else {
-        ip == cidr
+        let mut out = Vec::new();
+        for g in part.split(':') {
+            if g.is_empty() {
+                return None;
+            }
+            if g.contains('.') {
+                let v4 = parse_ipv4(g)?;
+                out.push((v4 >> 16) as u16);
+                out.push((v4 & 0xffff) as u16);
+                continue;
+            }
+            if g.len() > 4 {
+                return None;
+            }
+            out.push(u16::from_str_radix(g, 16).ok()?);
+        }
+        Some(out)
+    }
+
+    let pack = |g: &[u16]| g.iter().fold(0u128, |acc, &v| (acc << 16) | v as u128);
+
+    match s.find("::") {
+        Some(i) => {
+            let tail_str = &s[i + 2..];
+            if tail_str.contains("::") {
+                return None;
+            }
+            let head = groups(&s[..i])?;
+            let tail = groups(tail_str)?;
+            // "::" must stand in for at least one zero group
+            if head.len() + tail.len() > 7 {
+                return None;
+            }
+            let mut all = head;
+            all.resize(8 - tail.len(), 0);
+            all.extend(tail);
+            Some(pack(&all))
+        }
+        None => {
+            let all = groups(s)?;
+            if all.len() != 8 {
+                return None;
+            }
+            Some(pack(&all))
+        }
     }
 }
 
+fn is_valid_ip(s: &str) -> bool {
+    parse_ipv4(s).is_some() || parse_ipv6(s).is_some()
+}
+
+/// Return true if `ip` falls within `cidr`. Supports IPv4 and IPv6 CIDR notation, and a
+/// bare address as an implicit /32 or /128.
+fn ip_in_cidr(ip: &str, cidr: &str) -> bool {
+    if ip.is_empty() || cidr.is_empty() {
+        return false;
+    }
+    let (base, prefix_len) = match cidr.find('/') {
+        Some(slash) => match cidr[slash + 1..].parse::<u32>() {
+            Ok(n) => (&cidr[..slash], Some(n)),
+            Err(_) => return false,
+        },
+        None => (cidr, None),
+    };
+
+    if let (Some(ip_v4), Some(base_v4)) = (parse_ipv4(ip), parse_ipv4(base)) {
+        let prefix = prefix_len.unwrap_or(32);
+        if prefix > 32 {
+            return false;
+        }
+        let mask = if prefix == 0 {
+            0u32
+        } else {
+            !0u32 << (32 - prefix)
+        };
+        return (ip_v4 & mask) == (base_v4 & mask);
+    }
+
+    if let (Some(ip_v6), Some(base_v6)) = (parse_ipv6(ip), parse_ipv6(base)) {
+        let prefix = prefix_len.unwrap_or(128);
+        if prefix > 128 {
+            return false;
+        }
+        let mask = if prefix == 0 {
+            0u128
+        } else {
+            !0u128 << (128 - prefix)
+        };
+        return (ip_v6 & mask) == (base_v6 & mask);
+    }
+
+    // Mixed families, or an address neither side can parse: only an exact literal match
+    prefix_len.is_none() && ip == base
+}
+
 fn is_trusted_ip(ip: &str, trusted: &[String]) -> bool {
-    trusted.iter().any(|entry| ip_in_cidr(ip, entry))
+    trusted
+        .iter()
+        .any(|entry| !entry.is_empty() && ip_in_cidr(ip, entry))
+}
+
+/// Resolve the real client IP.
+///
+/// X-Forwarded-For is walked right-to-left, skipping hops that are themselves trusted
+/// proxies, and the first untrusted hop wins. The leftmost entry must never be taken:
+/// it is whatever the client sent, so a client behind a trusted proxy could otherwise
+/// set it to any value and walk straight past both the LAPI blocklist and AppSec's
+/// IP-scoped rules.
+///
+/// Returns None when the source address is missing or unparseable — the caller must then
+/// apply the fail-open/fail-closed policy rather than continuing with an empty identity.
+fn resolve_client_ip(source_ip: &str, xff: Option<&str>, trusted: &[String]) -> Option<String> {
+    if !is_valid_ip(source_ip) {
+        return None;
+    }
+    if trusted.is_empty() || !is_trusted_ip(source_ip, trusted) {
+        return Some(source_ip.to_string());
+    }
+    // No XFF from a trusted proxy just means it did not add one: that is the direct
+    // peer, not an unresolvable address
+    let xff = match xff {
+        Some(v) => v,
+        None => return Some(source_ip.to_string()),
+    };
+    for entry in xff.rsplit(',') {
+        let candidate = strip_port(entry.trim());
+        // A malformed hop means the chain can no longer be reasoned about; everything
+        // further left is unverifiable, so stop here
+        if !is_valid_ip(&candidate) {
+            break;
+        }
+        if !is_trusted_ip(&candidate, trusted) {
+            return Some(candidate);
+        }
+    }
+    Some(source_ip.to_string())
+}
+
+/// Pack a CIDR into the fixed-width record used in the shared-data range blobs.
+/// Returns (is_ipv6, record) with the base pre-masked so matching is a single AND.
+pub(crate) fn encode_range(cidr: &str) -> Option<(bool, Vec<u8>)> {
+    let (base, prefix) = match cidr.find('/') {
+        Some(slash) => (&cidr[..slash], Some(cidr[slash + 1..].parse::<u32>().ok()?)),
+        None => (cidr, None),
+    };
+
+    if let Some(addr) = parse_ipv4(base) {
+        let prefix = prefix.unwrap_or(32);
+        if prefix > 32 {
+            return None;
+        }
+        let mask = if prefix == 0 {
+            0u32
+        } else {
+            !0u32 << (32 - prefix)
+        };
+        let mut record = Vec::with_capacity(RANGE_V4_RECORD);
+        record.extend_from_slice(&(addr & mask).to_be_bytes());
+        record.extend_from_slice(&mask.to_be_bytes());
+        return Some((false, record));
+    }
+
+    if let Some(addr) = parse_ipv6(base) {
+        let prefix = prefix.unwrap_or(128);
+        if prefix > 128 {
+            return None;
+        }
+        let mask = if prefix == 0 {
+            0u128
+        } else {
+            !0u128 << (128 - prefix)
+        };
+        let mut record = Vec::with_capacity(RANGE_V6_RECORD);
+        record.extend_from_slice(&(addr & mask).to_be_bytes());
+        record.extend_from_slice(&mask.to_be_bytes());
+        return Some((true, record));
+    }
+
+    None
+}
+
+fn format_v4(addr: u32) -> String {
+    let o = addr.to_be_bytes();
+    format!("{}.{}.{}.{}", o[0], o[1], o[2], o[3])
+}
+
+fn format_v6(addr: u128) -> String {
+    (0..8)
+        .map(|i| format!("{:x}", (addr >> (112 - i * 16)) as u16))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Scan a packed range blob for a CIDR containing `ip`, returning it in CIDR notation
+/// for the block log.
+fn match_v4_range(ip: u32, blob: &[u8]) -> Option<String> {
+    for record in blob.as_chunks::<RANGE_V4_RECORD>().0 {
+        let base = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
+        let mask = u32::from_be_bytes([record[4], record[5], record[6], record[7]]);
+        if (ip & mask) == base {
+            return Some(format!("{}/{}", format_v4(base), mask.leading_ones()));
+        }
+    }
+    None
+}
+
+fn match_v6_range(ip: u128, blob: &[u8]) -> Option<String> {
+    for record in blob.as_chunks::<RANGE_V6_RECORD>().0 {
+        let mut base_bytes = [0u8; 16];
+        let mut mask_bytes = [0u8; 16];
+        base_bytes.copy_from_slice(&record[..16]);
+        mask_bytes.copy_from_slice(&record[16..]);
+        let base = u128::from_be_bytes(base_bytes);
+        let mask = u128::from_be_bytes(mask_bytes);
+        if (ip & mask) == base {
+            return Some(format!("{}/{}", format_v6(base), mask.leading_ones()));
+        }
+    }
+    None
+}
+
+/// Request headers never relayed to AppSec. HTTP/2 pseudo-headers are rebuilt for the
+/// dispatch, hop-by-hop and framing headers describe the client's connection rather than
+/// the request, and `x-crowdsec-appsec-*` is our own control channel — relaying a
+/// client-supplied one would let the client override the API key, IP, URI or verb that
+/// AppSec evaluates.
+fn is_forwardable_header(name: &str) -> bool {
+    if name.starts_with(':') {
+        return false;
+    }
+    let lower = name.to_lowercase();
+    if lower.starts_with("x-crowdsec-appsec-") {
+        return false;
+    }
+    !matches!(
+        lower.as_str(),
+        "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "host"
+    )
+}
+
+/// Snapshot the client's headers for later relay to AppSec, dropping the ones that must
+/// not cross the boundary and stopping once the byte budget is spent.
+fn collect_client_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut total = 0;
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        if !is_forwardable_header(&name) {
+            continue;
+        }
+        let cost = name.len() + value.len();
+        if total + cost > MAX_FORWARDED_HEADER_BYTES {
+            log::warn!(
+                "Request headers exceed {} bytes, truncating the set relayed to AppSec",
+                MAX_FORWARDED_HEADER_BYTES
+            );
+            break;
+        }
+        total += cost;
+        out.push((name, value));
+    }
+    out
 }
 
 /// Whether a request body's declared Content-Type is one AppSec can meaningfully
-/// inspect as text. Binary/compressed content types are skipped entirely (headers-only
-/// AppSec check) rather than forwarded, since raw binary noise scores as highly
-/// anomalous under signature-based WAF rules and can trigger false-positive bans on
-/// legitimate uploads.
+/// inspect as text. Binary/compressed content types are candidates for skipping
+/// (headers-only AppSec check) rather than forwarding, since raw binary noise scores as
+/// highly anomalous under signature-based WAF rules and can trigger false-positive bans
+/// on legitimate uploads.
 fn body_is_inspectable(content_type: &str) -> bool {
     if content_type.is_empty() {
         return true;
@@ -94,16 +361,77 @@ fn body_is_inspectable(content_type: &str) -> bool {
         || media.ends_with("+xml")
 }
 
-/// Whether on_http_request_body should dispatch the buffered body to AppSec now:
-/// only once per request, when enough data has accumulated or the stream ended,
-/// and never while a call is already in flight.
+/// Does this body prefix actually look like binary? Three signals, any of which is
+/// conclusive on its own for the encrypted/compressed/image payloads this exists to
+/// spare from a text-oriented WAF:
+///
+/// - a NUL byte, which no text payload carries;
+/// - a high proportion of control characters outside the usual whitespace set;
+/// - a byte distribution that is both heavily non-ASCII and sprinkled with control
+///   characters, which is what random or compressed data looks like. Neither half is
+///   sufficient alone: CJK UTF-8 is ~100% non-ASCII with no control bytes, and random
+///   data only reaches ~11% control bytes, well under the standalone threshold.
+///
+/// Deliberately *not* a UTF-8 validity check: that would let a single stray 0xff byte
+/// appended to a text payload turn the skip back into a one-byte bypass.
+fn looks_binary(prefix: &[u8]) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    let sample = &prefix[..prefix.len().min(SNIFF_PREFIX)];
+    if sample.contains(&0) {
+        return true;
+    }
+    let len = sample.len();
+    let control = sample
+        .iter()
+        .filter(|b| **b < 0x09 || (**b > 0x0d && **b < 0x20) || **b == 0x7f)
+        .count();
+    let non_ascii = sample.iter().filter(|b| **b >= 0x80).count();
+    control * 100 > len * 30 || (non_ascii * 100 > len * 40 && control * 100 > len * 5)
+}
+
+/// Whether the buffered body should go to AppSec.
+///
+/// The declared Content-Type only gets to *exclude* a body, and only when the bytes
+/// agree with it. Content-Type is attacker-controlled, so trusting it alone turns
+/// "skip binary uploads" into a one-header WAF bypass: a JSON injection payload sent as
+/// `application/octet-stream` would never be inspected, while plenty of backends parse
+/// the body regardless of what it claims to be.
+fn should_forward_body(content_type: &str, prefix: &[u8]) -> bool {
+    body_is_inspectable(content_type) || !looks_binary(prefix)
+}
+
+/// The Content-Type to relay for a body whose declared type claimed binary but whose
+/// bytes are text.
+///
+/// Forwarding such a body under its declared type is not enough: AppSec selects its body
+/// parser from Content-Type, so an `application/octet-stream` declaration leaves ARGS
+/// unpopulated and the SQLi/XSS rules that target ARGS never fire — the payload is
+/// relayed and then ignored. Re-label it from what the bytes actually are.
+///
+/// Anything that is not obviously JSON is labelled form-urlencoded rather than
+/// text/plain: that populates ARGS_NAMES with the raw content even when it does not
+/// parse as key=value pairs, which is the broadest rule coverage available.
+fn sniff_content_type(body: &[u8]) -> &'static str {
+    match body.iter().find(|b| !b.is_ascii_whitespace()) {
+        Some(b'{') | Some(b'[') => "application/json",
+        _ => "application/x-www-form-urlencoded",
+    }
+}
+
+/// Whether the buffered body should be dispatched to AppSec now: only once per request,
+/// when enough data has accumulated, the body was ruled out as binary, or the stream
+/// ended — and never while a call is already in flight or a verdict already landed.
 fn should_dispatch_appsec(
     pending: bool,
+    done: bool,
+    skipped: bool,
     body_len: usize,
     max_size: usize,
     end_of_stream: bool,
 ) -> bool {
-    !pending && (body_len >= max_size || end_of_stream)
+    !pending && !done && (skipped || body_len >= max_size || end_of_stream)
 }
 
 /// AppSec bot-detection challenge envelope: sent with HTTP 403 in place of a classic
@@ -198,9 +526,12 @@ pub struct CrowdSecHttpContext {
     method: String,
     host: String,
     user_agent: String,
-    cookie: String,
     content_type: String,
+    client_headers: Vec<(String, String)>,
     body_data: Vec<u8>,
+    has_body: bool,
+    body_decided: bool,
+    body_skipped: bool,
     appsec_pending: bool,
     appsec_done: bool,
     response_paused: bool,
@@ -215,9 +546,12 @@ impl CrowdSecHttpContext {
             method: String::new(),
             host: String::new(),
             user_agent: String::new(),
-            cookie: String::new(),
             content_type: String::new(),
+            client_headers: Vec::new(),
             body_data: Vec::new(),
+            has_body: false,
+            body_decided: false,
+            body_skipped: false,
             appsec_pending: false,
             appsec_done: false,
             response_paused: false,
@@ -226,6 +560,7 @@ impl CrowdSecHttpContext {
 
     fn send_appsec_event(&mut self) {
         let body_len = self.body_data.len().to_string();
+        let relayed_ct = self.relayed_content_type();
         let mut headers = vec![
             (":method", "POST"),
             (":path", "/"),
@@ -241,19 +576,27 @@ impl CrowdSecHttpContext {
             ),
             ("Content-Length", body_len.as_str()),
         ];
-        if !self.content_type.is_empty() && !self.body_data.is_empty() {
-            headers.push(("Content-Type", self.content_type.as_str()));
+        // Relay the client's own headers so AppSec rules matching on Referer, Origin,
+        // Cookie or any custom header can actually fire — forwarding only the metadata
+        // leaves every header-based rule blind. collect_client_headers has already
+        // dropped anything that must not cross this boundary.
+        for (name, value) in &self.client_headers {
+            // Content-Type is set below from the body we actually relay, not from what
+            // the client declared
+            if name.eq_ignore_ascii_case("content-type") {
+                continue;
+            }
+            headers.push((name.as_str(), value.as_str()));
         }
-        // Forward the client's cookies untouched so AppSec can recognise a
-        // previously-solved bot-detection challenge (__crowdsec_challenge cookie).
-        if !self.cookie.is_empty() {
-            headers.push(("Cookie", self.cookie.as_str()));
+        if let Some(ct) = &relayed_ct {
+            headers.push(("Content-Type", ct.as_str()));
         }
 
         log::info!(
-            "Sending AppSec event to cluster: {}, body length: {}",
+            "Sending AppSec event to cluster: {}, body length: {}, headers: {}",
             self.config.crowdsec.appsec.cluster,
-            self.body_data.len()
+            self.body_data.len(),
+            headers.len()
         );
 
         match self.dispatch_http_call(
@@ -296,16 +639,123 @@ impl CrowdSecHttpContext {
     }
 
     fn max_body_size(&self) -> usize {
-        (self.config.crowdsec.appsec.max_body_size_kb as usize) * 1024
+        (self.config.crowdsec.appsec.max_body_size_kb as usize).saturating_mul(1024)
     }
 
     fn max_response_body_size(&self) -> usize {
-        (self.config.crowdsec.appsec.max_response_body_size_kb as usize) * 1024
+        (self.config.crowdsec.appsec.max_response_body_size_kb as usize).saturating_mul(1024)
     }
 
+    /// Whether this request carries a body we should buffer for AppSec.
+    ///
+    /// Driven by body presence, not a method allowlist: DELETE bodies are ordinary in
+    /// REST APIs, plenty of frameworks read a body off GET and OPTIONS, and the method
+    /// string is compared case-sensitively — so an allowlist leaves all of those
+    /// uninspected.
     fn request_has_body(&self) -> bool {
-        self.config.crowdsec.appsec.forward_body
-            && matches!(self.method.as_str(), "POST" | "PUT" | "PATCH")
+        self.config.crowdsec.appsec.forward_body && self.has_body
+    }
+
+    /// Run the binary/text sniff once, and drop the buffer if the body really is binary.
+    /// Deciding here on the bytes, rather than up front on the declared Content-Type,
+    /// is what stops a mislabelled payload from skipping inspection.
+    fn decide_body_forwarding(&mut self) {
+        if self.body_decided {
+            return;
+        }
+        self.body_decided = true;
+        if !should_forward_body(&self.content_type, &self.body_data) {
+            log::info!(
+                "Body bytes look binary (content-type: {}), headers-only AppSec check",
+                self.content_type
+            );
+            self.body_skipped = true;
+            self.body_data.clear();
+            self.body_data.shrink_to_fit();
+        }
+    }
+
+    /// Content-Type to send with the relayed body, or None when no body is relayed.
+    fn relayed_content_type(&self) -> Option<String> {
+        if self.body_data.is_empty() {
+            return None;
+        }
+        if !self.content_type.is_empty() && body_is_inspectable(&self.content_type) {
+            return Some(self.content_type.clone());
+        }
+        // A body with no declared type at all gets sniffed too, rather than relayed with
+        // an empty Content-Type that leaves AppSec no parser to pick
+        let sniffed = sniff_content_type(&self.body_data);
+        if !self.content_type.is_empty() {
+            log::info!(
+                "Body declared as {} but its bytes are text, relaying to AppSec as {}",
+                self.content_type,
+                sniffed
+            );
+        }
+        Some(sniffed.to_string())
+    }
+
+    /// Single dispatch point shared by the body and trailer callbacks.
+    fn finalize_and_dispatch(&mut self, end_of_stream: bool) {
+        if self.appsec_pending || self.appsec_done {
+            return;
+        }
+        let max_size = self.max_body_size();
+        if self.body_data.len() >= max_size || end_of_stream {
+            self.decide_body_forwarding();
+        }
+        if should_dispatch_appsec(
+            self.appsec_pending,
+            self.appsec_done,
+            self.body_skipped,
+            self.body_data.len(),
+            max_size,
+            end_of_stream,
+        ) {
+            log::info!(
+                "Dispatching AppSec: {} bytes, end_of_stream={}",
+                self.body_data.len(),
+                end_of_stream
+            );
+            self.send_appsec_event();
+        }
+    }
+
+    /// Check the client IP against both the per-IP decisions and the synced CIDR ranges.
+    fn is_ip_blocked(&self) -> bool {
+        let key = format!("ip:{}", self.ip);
+        let (decision_data, _) = self.get_shared_data(&key);
+        if let Some(decision) = decision_data {
+            if !decision.is_empty() {
+                log::warn!(
+                    "Blocking IP {}: {}",
+                    self.ip,
+                    String::from_utf8_lossy(&decision)
+                );
+                return true;
+            }
+        }
+        // Range-scope decisions are stored as packed CIDR blobs rather than per-IP keys.
+        // Without this check every CIDR ban LAPI sends would be synced and then silently
+        // ignored — and community blocklists are largely CIDR.
+        if let Some(cidr) = self.matched_banned_range() {
+            log::warn!("Blocking IP {}: inside banned range {}", self.ip, cidr);
+            return true;
+        }
+        false
+    }
+
+    fn matched_banned_range(&self) -> Option<String> {
+        if let Some(ip) = parse_ipv4(&self.ip) {
+            let (blob, _) = self.get_shared_data(RANGES_V4_KEY);
+            return blob.and_then(|b| match_v4_range(ip, &b));
+        }
+        if let Some(ip) = parse_ipv6(&self.ip) {
+            let (blob, _) = self.get_shared_data(RANGES_V6_KEY);
+            return blob.and_then(|b| match_v6_range(ip, &b));
+        }
+        None
     }
 }
 
@@ -416,19 +866,30 @@ impl HttpContext for CrowdSecHttpContext {
             .map(|addr| strip_port(&addr))
             .unwrap_or_default();
 
-        // Only honour X-Forwarded-For when the direct peer is a configured trusted proxy,
-        // preventing clients from spoofing their IP via that header.
-        let trusted = !self.config.crowdsec.trusted_ips.is_empty()
-            && is_trusted_ip(&source_ip, &self.config.crowdsec.trusted_ips);
-
-        self.ip = if trusted {
-            // Use the leftmost (original client) IP from XFF, falling back to source_ip.
-            self.get_http_request_header("x-forwarded-for")
-                .and_then(|xff| xff.split(',').next().map(|s| s.trim().to_string()))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| source_ip.clone())
-        } else {
-            source_ip
+        let xff = self.get_http_request_header("x-forwarded-for");
+        self.ip = match resolve_client_ip(
+            &source_ip,
+            xff.as_deref(),
+            &self.config.crowdsec.trusted_ips,
+        ) {
+            Some(ip) => ip,
+            None => {
+                // Continuing with an empty identity would silently disable the blocklist
+                // lookup and send AppSec a blank IP, so treat it as a failure instead.
+                log::error!(
+                    "Cannot determine client IP (source address: {:?}), applying fail policy",
+                    source_ip
+                );
+                if self.config.crowdsec.appsec.fail_open {
+                    return Action::Continue;
+                }
+                self.send_http_response(
+                    403,
+                    vec![("content-type", "text/plain")],
+                    Some(b"Access Denied"),
+                );
+                return Action::Pause;
+            }
         };
 
         self.path = self.get_http_request_header(":path").unwrap_or_default();
@@ -439,57 +900,37 @@ impl HttpContext for CrowdSecHttpContext {
         self.host = self
             .get_http_request_header(":authority")
             .unwrap_or_default();
-        self.cookie = self.get_http_request_header("cookie").unwrap_or_default();
 
         log::info!("Request: {} {} from {}", self.method, self.path, self.ip);
 
         // Check IP blocking
-        if self.config.crowdsec.lapi.enabled {
-            let key = format!("ip:{}", self.ip);
-            let (decision_data, _) = self.get_shared_data(&key);
-            if let Some(decision) = decision_data {
-                if !decision.is_empty() {
-                    log::warn!(
-                        "Blocking IP {}: {}",
-                        self.ip,
-                        String::from_utf8_lossy(&decision)
-                    );
-                    self.send_http_response(
-                        403,
-                        vec![("content-type", "text/plain")],
-                        Some(b"Access Denied"),
-                    );
-                    return Action::Pause;
-                }
-            }
+        if self.config.crowdsec.lapi.enabled && self.is_ip_blocked() {
+            self.send_http_response(
+                403,
+                vec![("content-type", "text/plain")],
+                Some(b"Access Denied"),
+            );
+            return Action::Pause;
         }
 
         if !self.config.crowdsec.appsec.enabled {
             return Action::Continue;
         }
 
+        self.client_headers = collect_client_headers(self.get_http_request_headers());
+        self.content_type = self
+            .get_http_request_header("content-type")
+            .unwrap_or_default();
+
+        let content_length = self
+            .get_http_request_header("content-length")
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        self.has_body = !end_of_stream || content_length > 0;
+
         if self.request_has_body() {
-            self.content_type = self
-                .get_http_request_header("content-type")
-                .unwrap_or_default();
-
-            if !body_is_inspectable(&self.content_type) {
-                // Binary/compressed body: skip forwarding it to AppSec entirely
-                // (headers-only check) and let it stream straight through.
-                log::info!(
-                    "Body not inspectable ({}), headers-only AppSec check",
-                    self.content_type
-                );
-                self.send_appsec_event();
-                return if self.config.crowdsec.appsec.async_mode {
-                    Action::Continue
-                } else {
-                    Action::Pause
-                };
-            }
-
             if !end_of_stream {
-                log::info!("Request has inspectable body, waiting for body data");
+                log::info!("Request has a body, waiting for body data");
                 return Action::Continue;
             }
             // Body arrived with headers (end_of_stream=true): read it now
@@ -501,9 +942,10 @@ impl HttpContext for CrowdSecHttpContext {
                 }
                 None => log::warn!("get_http_request_body(0, {}) returned None", max_size),
             }
+            self.decide_body_forwarding();
         }
 
-        // No body or inspectable body already read: dispatch AppSec
+        // No body, or the whole body is already buffered: dispatch AppSec
         self.send_appsec_event();
         if self.config.crowdsec.appsec.async_mode {
             Action::Continue
@@ -528,9 +970,10 @@ impl HttpContext for CrowdSecHttpContext {
             return Action::Continue;
         }
 
-        // Non-inspectable body: AppSec was already dispatched headers-only in
-        // on_http_request_headers; let the body stream through untouched.
-        if self.request_has_body() && !body_is_inspectable(&self.content_type) {
+        // Nothing left to buffer: either this body is not ours to inspect, or the sniff
+        // already ruled it out. The stream still has to be able to trigger the dispatch.
+        if !self.request_has_body() || self.body_skipped {
+            self.finalize_and_dispatch(end_of_stream);
             return Action::Continue;
         }
 
@@ -560,24 +1003,25 @@ impl HttpContext for CrowdSecHttpContext {
             }
         }
 
-        // Dispatch AppSec once we have enough data or stream ends — but only once
-        // per request: skip while a call is already in flight, otherwise every
-        // later chunk that still satisfies this condition re-dispatches, causing
-        // overlapping AppSec calls that each independently resume/respond.
-        if should_dispatch_appsec(
-            self.appsec_pending,
-            self.body_data.len(),
-            max_size,
-            end_of_stream,
-        ) {
-            log::info!(
-                "Dispatching AppSec: {} bytes, end_of_stream={}",
-                self.body_data.len(),
-                end_of_stream
-            );
-            self.send_appsec_event();
+        // Enough bytes to judge text vs binary without waiting for the whole body
+        if self.body_data.len() >= SNIFF_PREFIX {
+            self.decide_body_forwarding();
         }
 
+        self.finalize_and_dispatch(end_of_stream);
+        Action::Continue
+    }
+
+    fn on_http_request_trailers(&mut self, _num_trailers: usize) -> Action {
+        if !self.config.crowdsec.appsec.enabled || self.appsec_done {
+            return Action::Continue;
+        }
+        // Trailers, not a final DATA frame, terminate a request that has them: Envoy
+        // delivers the last body chunk with end_stream=false and signals the end here,
+        // so on_http_request_body never sees end_of_stream=true. Without this the AppSec
+        // call is never dispatched at all and the request passes completely uninspected.
+        log::debug!("Request trailers received, finalizing AppSec dispatch");
+        self.finalize_and_dispatch(true);
         Action::Continue
     }
 
@@ -618,6 +1062,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_ipv6_basic_and_compressed() {
+        assert_eq!(parse_ipv6("::1"), Some(1));
+        assert_eq!(parse_ipv6("::"), Some(0));
+        assert_eq!(parse_ipv6("2001:db8::1").unwrap() >> 96, 0x2001_0db8);
+        assert_eq!(
+            parse_ipv6("0000:0000:0000:0000:0000:0000:0000:0001"),
+            Some(1)
+        );
+        // Leading-zero-insensitive: the same address written two ways must match
+        assert_eq!(parse_ipv6("2001:0db8::0001"), parse_ipv6("2001:db8::1"));
+    }
+
+    #[test]
+    fn test_parse_ipv6_embedded_ipv4_tail() {
+        assert_eq!(parse_ipv6("::ffff:192.0.2.1"), Some(0xffff_c000_0201));
+    }
+
+    #[test]
+    fn test_parse_ipv6_rejects_malformed() {
+        assert!(parse_ipv6("").is_none());
+        assert!(parse_ipv6("1.2.3.4").is_none());
+        assert!(parse_ipv6("1::2::3").is_none());
+        assert!(parse_ipv6("12345::1").is_none());
+        assert!(parse_ipv6("1:2:3:4:5:6:7").is_none());
+        assert!(parse_ipv6("gggg::1").is_none());
+    }
+
+    #[test]
     fn test_ip_in_cidr_ipv4_exact() {
         assert!(ip_in_cidr("10.0.0.1", "10.0.0.1"));
         assert!(!ip_in_cidr("10.0.0.2", "10.0.0.1"));
@@ -644,8 +1116,276 @@ mod tests {
     }
 
     #[test]
+    fn test_ip_in_cidr_ipv6_prefix() {
+        // Previously unsupported: an IPv6 CIDR degraded to an exact string compare, so
+        // an IPv6 trusted proxy could never match its own configured range.
+        assert!(ip_in_cidr("2001:db8::1", "2001:db8::/32"));
+        assert!(ip_in_cidr("2001:db8:ffff::abcd", "2001:db8::/32"));
+        assert!(!ip_in_cidr("2001:db9::1", "2001:db8::/32"));
+        assert!(ip_in_cidr("::1", "::/0"));
+        assert!(!ip_in_cidr("2001:db8::1", "2001:db8::/129"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_mixed_families_never_match() {
+        assert!(!ip_in_cidr("::1", "10.0.0.0/8"));
+        assert!(!ip_in_cidr("10.0.0.1", "2001:db8::/32"));
+    }
+
+    #[test]
+    fn test_ip_in_cidr_rejects_empty() {
+        // An empty entry must never match an empty/unresolved address, which would
+        // otherwise mark an arbitrary peer as a trusted proxy.
+        assert!(!ip_in_cidr("", ""));
+        assert!(!ip_in_cidr("", "10.0.0.0/8"));
+        assert!(!ip_in_cidr("10.0.0.1", ""));
+    }
+
+    #[test]
     fn test_is_trusted_ip_empty_list() {
         assert!(!is_trusted_ip("1.2.3.4", &[]));
+    }
+
+    #[test]
+    fn test_is_trusted_ip_matches() {
+        let trusted = vec!["10.0.0.0/8".to_string(), "192.168.1.100".to_string()];
+        assert!(is_trusted_ip("10.5.6.7", &trusted));
+        assert!(is_trusted_ip("192.168.1.100", &trusted));
+        assert!(!is_trusted_ip("172.16.0.1", &trusted));
+    }
+
+    #[test]
+    fn test_is_trusted_ip_skips_empty_entries() {
+        assert!(!is_trusted_ip("", &["".to_string()]));
+    }
+
+    #[test]
+    fn test_resolve_client_ip_no_trusted_proxies_uses_source() {
+        // XFF must be ignored entirely when no proxy is trusted
+        assert_eq!(
+            resolve_client_ip("1.2.3.4", Some("9.9.9.9"), &[]),
+            Some("1.2.3.4".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_untrusted_peer_ignores_xff() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("1.2.3.4", Some("9.9.9.9"), &trusted),
+            Some("1.2.3.4".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_takes_rightmost_untrusted_hop() {
+        // The client controls the left of the chain. With one trusted proxy in front,
+        // the real client is the rightmost entry, not the leftmost - taking the leftmost
+        // let any client behind a trusted proxy claim an arbitrary IP.
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("9.9.9.9, 5.5.5.5"), &trusted),
+            Some("5.5.5.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_skips_trusted_hops_in_chain() {
+        let trusted = vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("5.5.5.5, 172.16.0.9, 10.0.0.2"), &trusted),
+            Some("5.5.5.5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_spoofed_prefix_is_not_reachable() {
+        // Attacker prepends a fake hop; the genuine one appended by the proxy wins.
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("1.1.1.1, 2.2.2.2, 8.8.8.8"), &trusted),
+            Some("8.8.8.8".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_all_hops_trusted_falls_back_to_source() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("10.0.0.5, 10.0.0.6"), &trusted),
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_stops_at_malformed_hop() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("5.5.5.5, not-an-ip"), &trusted),
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_strips_ports_from_hops() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("5.5.5.5:41234"), &trusted),
+            Some("5.5.5.5".to_string())
+        );
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", Some("[2001:db8::1]:443"), &trusted),
+            Some("2001:db8::1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_missing_xff_falls_back_to_source() {
+        let trusted = vec!["10.0.0.0/8".to_string()];
+        assert_eq!(
+            resolve_client_ip("10.0.0.1", None, &trusted),
+            Some("10.0.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_ip_unresolvable_source_is_an_error() {
+        // Empty or non-IP source addresses must surface as None so the caller applies
+        // the fail policy instead of proceeding with a blank identity that matches no
+        // blocklist entry.
+        assert!(resolve_client_ip("", Some("1.2.3.4"), &[]).is_none());
+        assert!(resolve_client_ip("/var/run/envoy.sock", None, &[]).is_none());
+        assert!(resolve_client_ip("", None, &["".to_string()]).is_none());
+    }
+
+    #[test]
+    fn test_encode_range_ipv4_masks_base() {
+        let (is_v6, record) = encode_range("192.168.1.55/24").expect("should encode");
+        assert!(!is_v6);
+        assert_eq!(record.len(), RANGE_V4_RECORD);
+        // Base is stored pre-masked so matching is a single AND
+        assert_eq!(&record[..4], &[192, 168, 1, 0]);
+        assert_eq!(&record[4..], &[255, 255, 255, 0]);
+    }
+
+    #[test]
+    fn test_encode_range_bare_ip_is_host_route() {
+        let (_, record) = encode_range("10.0.0.1").expect("should encode");
+        assert_eq!(&record[4..], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn test_encode_range_ipv6() {
+        let (is_v6, record) = encode_range("2001:db8::/32").expect("should encode");
+        assert!(is_v6);
+        assert_eq!(record.len(), RANGE_V6_RECORD);
+    }
+
+    #[test]
+    fn test_encode_range_rejects_garbage() {
+        assert!(encode_range("not-a-cidr").is_none());
+        assert!(encode_range("10.0.0.0/33").is_none());
+        assert!(encode_range("2001:db8::/129").is_none());
+        assert!(encode_range("10.0.0.0/abc").is_none());
+        assert!(encode_range("").is_none());
+    }
+
+    #[test]
+    fn test_match_v4_range_hit_and_miss() {
+        let (_, a) = encode_range("192.168.0.0/16").unwrap();
+        let (_, b) = encode_range("10.0.0.0/8").unwrap();
+        let blob: Vec<u8> = [a, b].concat();
+
+        assert_eq!(
+            match_v4_range(parse_ipv4("10.5.6.7").unwrap(), &blob),
+            Some("10.0.0.0/8".to_string())
+        );
+        assert_eq!(
+            match_v4_range(parse_ipv4("192.168.99.1").unwrap(), &blob),
+            Some("192.168.0.0/16".to_string())
+        );
+        assert!(match_v4_range(parse_ipv4("172.16.0.1").unwrap(), &blob).is_none());
+    }
+
+    #[test]
+    fn test_match_v4_range_empty_blob() {
+        assert!(match_v4_range(parse_ipv4("10.0.0.1").unwrap(), &[]).is_none());
+    }
+
+    #[test]
+    fn test_match_v6_range_hit_and_miss() {
+        let (_, record) = encode_range("2001:db8::/32").unwrap();
+        assert!(match_v6_range(parse_ipv6("2001:db8::dead:beef").unwrap(), &record).is_some());
+        assert!(match_v6_range(parse_ipv6("2001:db9::1").unwrap(), &record).is_none());
+    }
+
+    #[test]
+    fn test_is_forwardable_header_drops_control_channel() {
+        // A client-supplied X-Crowdsec-Appsec-* header must never reach AppSec: it would
+        // override the API key, IP, URI or verb the WAF evaluates.
+        assert!(!is_forwardable_header("X-Crowdsec-Appsec-Api-Key"));
+        assert!(!is_forwardable_header("x-crowdsec-appsec-ip"));
+        assert!(!is_forwardable_header("X-CROWDSEC-APPSEC-VERB"));
+    }
+
+    #[test]
+    fn test_is_forwardable_header_drops_pseudo_and_framing() {
+        assert!(!is_forwardable_header(":method"));
+        assert!(!is_forwardable_header(":path"));
+        assert!(!is_forwardable_header("content-length"));
+        assert!(!is_forwardable_header("Transfer-Encoding"));
+        assert!(!is_forwardable_header("connection"));
+        assert!(!is_forwardable_header("host"));
+    }
+
+    #[test]
+    fn test_is_forwardable_header_keeps_rule_relevant_headers() {
+        assert!(is_forwardable_header("referer"));
+        assert!(is_forwardable_header("Cookie"));
+        assert!(is_forwardable_header("user-agent"));
+        assert!(is_forwardable_header("content-type"));
+        assert!(is_forwardable_header("X-Api-Version"));
+        assert!(is_forwardable_header("Authorization"));
+    }
+
+    #[test]
+    fn test_collect_client_headers_filters_and_preserves() {
+        let headers = vec![
+            (":method".to_string(), "POST".to_string()),
+            (
+                "referer".to_string(),
+                "http://evil/${jndi:ldap://x}".to_string(),
+            ),
+            (
+                "x-crowdsec-appsec-api-key".to_string(),
+                "stolen".to_string(),
+            ),
+            ("content-length".to_string(), "42".to_string()),
+            ("cookie".to_string(), "a=b".to_string()),
+        ];
+        let out = collect_client_headers(headers);
+        assert_eq!(
+            out,
+            vec![
+                (
+                    "referer".to_string(),
+                    "http://evil/${jndi:ldap://x}".to_string()
+                ),
+                ("cookie".to_string(), "a=b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_collect_client_headers_respects_byte_budget() {
+        let big = "x".repeat(MAX_FORWARDED_HEADER_BYTES);
+        let headers = vec![
+            ("referer".to_string(), big),
+            ("cookie".to_string(), "a=b".to_string()),
+        ];
+        let out = collect_client_headers(headers);
+        // The oversized header alone exhausts the budget; nothing after it is relayed
+        assert_eq!(out.len(), 0);
     }
 
     #[test]
@@ -680,38 +1420,150 @@ mod tests {
     }
 
     #[test]
+    fn test_looks_binary_detects_nul_and_control_bytes() {
+        assert!(looks_binary(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
+        assert!(looks_binary(&[0x00; 64]));
+        assert!(looks_binary(&(0u8..32).collect::<Vec<u8>>()));
+    }
+
+    #[test]
+    fn test_looks_binary_detects_high_entropy_without_nul() {
+        // Random/compressed payloads only reach ~11% control bytes, so the control-char
+        // ratio alone misses them whenever no NUL lands in the sample. Without the
+        // non-ASCII signal this was a coin flip on real uploads.
+        let entropy: Vec<u8> = (0..512u32)
+            .map(|i| {
+                let v = (i.wrapping_mul(2654435761) >> 13) as u8;
+                if v == 0 {
+                    1
+                } else {
+                    v
+                }
+            })
+            .collect();
+        assert!(!entropy.contains(&0));
+        assert!(looks_binary(&entropy));
+    }
+
+    #[test]
+    fn test_looks_binary_accepts_dense_multibyte_text() {
+        // Fully non-ASCII but with no control bytes: must not be mistaken for binary.
+        let cjk = "\u{4f60}\u{597d}\u{4e16}\u{754c}".repeat(40);
+        assert!(!looks_binary(cjk.as_bytes()));
+    }
+
+    #[test]
+    fn test_looks_binary_ignores_stray_invalid_utf8() {
+        // A single junk byte appended to a text payload must not flip the verdict -
+        // otherwise the binary skip becomes a one-byte bypass again.
+        let mut payload = b"<script>alert(document.cookie)</script>".to_vec();
+        payload.push(0xff);
+        assert!(!looks_binary(&payload));
+    }
+
+    #[test]
+    fn test_looks_binary_accepts_text() {
+        assert!(!looks_binary(b""));
+        assert!(!looks_binary(br#"{"user":"admin' OR 1=1--"}"#));
+        assert!(!looks_binary(b"name=value&other=thing\r\n"));
+        // High bytes are ordinary UTF-8, not a binary signal
+        assert!(!looks_binary("héllo wörld déjà vu".as_bytes()));
+    }
+
+    #[test]
+    fn test_should_forward_body_honours_declared_text_type() {
+        assert!(should_forward_body("application/json", br#"{"a":1}"#));
+    }
+
+    #[test]
+    fn test_should_forward_body_skips_genuine_binary() {
+        assert!(!should_forward_body(
+            "application/octet-stream",
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+        ));
+        assert!(!should_forward_body("image/png", &[0u8; 128]));
+    }
+
+    #[test]
+    fn test_should_forward_body_inspects_mislabelled_text_payload() {
+        // The WAF bypass this closes: declare a binary content type, send a text
+        // injection payload, and the body used to skip inspection entirely.
+        assert!(should_forward_body(
+            "application/octet-stream",
+            br#"{"q":"1' UNION SELECT password FROM users--"}"#
+        ));
+        assert!(should_forward_body(
+            "image/png",
+            b"<script>alert(document.cookie)</script>"
+        ));
+    }
+
+    #[test]
+    fn test_should_forward_body_empty_body_is_not_binary() {
+        assert!(should_forward_body("application/octet-stream", b""));
+    }
+
+    #[test]
+    fn test_sniff_content_type_json() {
+        assert_eq!(sniff_content_type(br#"{"a":1}"#), "application/json");
+        assert_eq!(sniff_content_type(b"  \n [1,2,3]"), "application/json");
+    }
+
+    #[test]
+    fn test_sniff_content_type_defaults_to_form() {
+        // Not parseable as key=value, but labelling it form-urlencoded still lands the
+        // raw content in ARGS_NAMES, where the XSS rules can see it.
+        assert_eq!(
+            sniff_content_type(b"username=admin' OR 1=1--"),
+            "application/x-www-form-urlencoded"
+        );
+        assert_eq!(
+            sniff_content_type(b"<script>alert(1)</script>"),
+            "application/x-www-form-urlencoded"
+        );
+        assert_eq!(sniff_content_type(b""), "application/x-www-form-urlencoded");
+    }
+
+    #[test]
     fn test_should_dispatch_appsec_at_size_threshold() {
-        assert!(should_dispatch_appsec(false, 100, 100, false));
+        assert!(should_dispatch_appsec(false, false, false, 100, 100, false));
     }
 
     #[test]
     fn test_should_dispatch_appsec_below_threshold_mid_stream() {
-        assert!(!should_dispatch_appsec(false, 50, 100, false));
+        assert!(!should_dispatch_appsec(false, false, false, 50, 100, false));
     }
 
     #[test]
     fn test_should_dispatch_appsec_end_of_stream_triggers() {
-        assert!(should_dispatch_appsec(false, 10, 100, true));
+        assert!(should_dispatch_appsec(false, false, false, 10, 100, true));
+    }
+
+    #[test]
+    fn test_should_dispatch_appsec_skipped_body_dispatches_immediately() {
+        // A body ruled out as binary never reaches the size threshold, so the
+        // headers-only check has to fire on the skip flag instead of waiting for the
+        // upload to finish.
+        assert!(should_dispatch_appsec(false, false, true, 0, 100, false));
     }
 
     #[test]
     fn test_should_dispatch_appsec_skipped_while_pending() {
         // Regression: a call already in flight must not be re-dispatched even
         // though the buffer is full (this was the duplicate-dispatch bug).
-        assert!(!should_dispatch_appsec(true, 100, 100, false));
+        assert!(!should_dispatch_appsec(true, false, false, 100, 100, false));
     }
 
     #[test]
     fn test_should_dispatch_appsec_skipped_while_pending_at_end_of_stream() {
-        assert!(!should_dispatch_appsec(true, 100, 100, true));
+        assert!(!should_dispatch_appsec(true, false, false, 100, 100, true));
     }
 
     #[test]
-    fn test_is_trusted_ip_matches() {
-        let trusted = vec!["10.0.0.0/8".to_string(), "192.168.1.100".to_string()];
-        assert!(is_trusted_ip("10.5.6.7", &trusted));
-        assert!(is_trusted_ip("192.168.1.100", &trusted));
-        assert!(!is_trusted_ip("172.16.0.1", &trusted));
+    fn test_should_dispatch_appsec_not_after_verdict() {
+        // Once AppSec has ruled, a late trailer or body chunk must not dispatch again.
+        assert!(!should_dispatch_appsec(false, true, false, 100, 100, true));
+        assert!(!should_dispatch_appsec(false, true, true, 0, 100, true));
     }
 
     #[test]
