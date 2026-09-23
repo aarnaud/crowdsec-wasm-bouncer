@@ -6,7 +6,9 @@ use std::time::UNIX_EPOCH;
 
 use crate::config::Config;
 use crate::http::CrowdSecHttpContext;
-use crate::http::{encode_range, RANGES_V4_KEY, RANGES_V6_KEY, RANGE_V4_RECORD, RANGE_V6_RECORD};
+use crate::http::{encode_range, split_expiry, with_expiry};
+use crate::http::{IP_DECISION_PREFIX, RANGES_V4_KEY, RANGES_V6_KEY};
+use crate::http::{RANGE_V4_RECORD, RANGE_V6_RECORD};
 
 #[derive(Deserialize)]
 struct DecisionsResponse {
@@ -23,6 +25,11 @@ struct Decision {
     scope: String,
     value: String,
     scenario: String,
+    // Every decision carries its own lifetime ("3h59m57s", negative once elapsed).
+    // Honouring it is what keeps a missed `deleted` notification from banning an
+    // address permanently.
+    #[serde(default)]
+    duration: String,
 }
 
 /// Hard cap on the LAPI decisions-stream response body read per sync tick.
@@ -33,6 +40,66 @@ const MAX_LAPI_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
 /// Cap on stored Range decisions per address family. Each one is scanned on every
 /// request, so this bounds both shared-data memory and the per-request match cost.
 const MAX_RANGE_DECISIONS: usize = 4096;
+
+/// Shared-data flag marking the full `startup=true` pull as done.
+///
+/// It lives in shared data rather than a struct field because every worker thread runs
+/// its own WASM VM with its own copy of those fields: a per-instance flag means each VM
+/// independently believes it is the first and pulls the entire decision set, so an
+/// 8-worker proxy does eight full syncs on every start. Only set once the sync actually
+/// succeeds, so a failed pull is retried instead of leaving the bouncer empty.
+const STARTUP_DONE_KEY: &str = "crowdsec_startup_done";
+
+/// Applied when a decision's duration is missing or unparseable. Dropping the decision
+/// would fail open, and treating it as permanent is the bug this replaces, so bound it.
+const DEFAULT_DECISION_TTL_MS: i64 = 3_600_000;
+
+/// Parse a Go duration into milliseconds, as sent in a decision's `duration` field
+/// ("3h59m57s", "29m57s", "1m30.5s", or negative like "-52m11s" once elapsed).
+fn parse_go_duration_ms(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    let (negative, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    if body == "0" {
+        return Some(0);
+    }
+
+    let bytes = body.as_bytes();
+    let mut total_ms = 0f64;
+    let mut i = 0;
+    while i < bytes.len() {
+        let number_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        if i == number_start {
+            return None;
+        }
+        let amount: f64 = body[number_start..i].parse().ok()?;
+
+        let unit_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_digit() && bytes[i] != b'.' {
+            i += 1;
+        }
+        total_ms += match &body[unit_start..i] {
+            "ns" => amount / 1_000_000.0,
+            "us" | "\u{b5}s" | "\u{3bc}s" => amount / 1_000.0,
+            "ms" => amount,
+            "s" => amount * 1_000.0,
+            "m" => amount * 60_000.0,
+            "h" => amount * 3_600_000.0,
+            _ => return None,
+        };
+    }
+
+    let total = total_ms as i64;
+    Some(if negative { -total } else { total })
+}
 
 /// How long a held sync lock may go unreleased before another worker steals it.
 /// The lock is released in on_http_call_response, so it only outlives its holder when
@@ -52,18 +119,19 @@ fn parse_lock_timestamp(data: &[u8]) -> Option<u64> {
 
 pub struct CrowdSecPlugin {
     config: Option<Config>,
-    first_sync: bool,
+    /// Whether the sync currently in flight from this VM is the startup pull
+    pending_startup: bool,
 }
 
 impl CrowdSecPlugin {
     pub fn new() -> Self {
         Self {
             config: None,
-            first_sync: true,
+            pending_startup: false,
         }
     }
 
-    fn sync_decisions(&mut self, startup: bool) {
+    fn sync_decisions(&mut self) {
         let config = match &self.config {
             Some(c) => c,
             None => return,
@@ -109,6 +177,12 @@ impl CrowdSecPlugin {
             return;
         }
 
+        // Decided here, under the lock, from shared state rather than a per-VM field, so
+        // only one worker's VM performs the full pull
+        let (startup_flag, _) = self.get_shared_data(STARTUP_DONE_KEY);
+        let startup = !matches!(startup_flag, Some(ref v) if !v.is_empty());
+        self.pending_startup = startup;
+
         log::info!("Lock acquired, starting sync (startup={})", startup);
 
         let path = if startup {
@@ -143,22 +217,49 @@ impl CrowdSecPlugin {
 
     /// Apply additions and removals to a packed range blob in shared data. Records are
     /// fixed-width, so add/remove is a byte-slice comparison with no parsing.
+    /// Apply additions and removals to a packed range blob in shared data.
+    ///
+    /// Records are fixed-width, so add/remove is a byte-slice comparison with no parsing.
+    /// Identity is the CIDR part only, not the whole record: the same range re-sent with
+    /// a refreshed lifetime must replace the existing entry rather than accumulate beside
+    /// it. Expired records are dropped while the blob is being rewritten anyway - this
+    /// runs under the sync lock, so it is the one place with a single writer.
     fn update_range_blob(
         &self,
         key: &str,
         record_size: usize,
         add: &[Vec<u8>],
         remove: &[Vec<u8>],
+        now: u64,
     ) {
         if add.is_empty() && remove.is_empty() {
             return;
         }
+        fn cidr_of(record: &[u8]) -> Option<&[u8]> {
+            split_expiry(record).map(|(_, cidr)| cidr)
+        }
+
         let (existing, cas) = self.get_shared_data(key);
         let existing = existing.unwrap_or_default();
         let mut records: Vec<&[u8]> = existing.chunks_exact(record_size).collect();
-        records.retain(|r| !remove.iter().any(|d| d.as_slice() == *r));
-        for r in add {
-            if records.contains(&r.as_slice()) {
+
+        let before = records.len();
+        records.retain(|record| match split_expiry(record) {
+            Some((expires_at, cidr)) => {
+                expires_at > now && !remove.iter().any(|d| d.as_slice() == cidr)
+            }
+            None => false,
+        });
+        let dropped = before - records.len();
+
+        for record in add {
+            let cidr = match cidr_of(record) {
+                Some(c) => c,
+                None => continue,
+            };
+            if let Some(pos) = records.iter().position(|e| cidr_of(e) == Some(cidr)) {
+                // Same range, refreshed lifetime
+                records[pos] = record.as_slice();
                 continue;
             }
             if records.len() >= MAX_RANGE_DECISIONS {
@@ -169,14 +270,20 @@ impl CrowdSecPlugin {
                 );
                 break;
             }
-            records.push(r.as_slice());
+            records.push(record.as_slice());
         }
+
+        let count = records.len();
         let blob: Vec<u8> = records.concat();
-        let count = blob.len() / record_size;
         if self.set_shared_data(key, Some(&blob), cas).is_err() {
             log::error!("Failed to update range blob {} (CAS conflict)", key);
         } else {
-            log::info!("Range blob {} now holds {} entries", key, count);
+            log::info!(
+                "Range blob {} now holds {} entries ({} expired or removed)",
+                key,
+                count,
+                dropped
+            );
         }
     }
 }
@@ -211,11 +318,20 @@ impl Context for CrowdSecPlugin {
             return;
         }
 
-        if body_size > MAX_LAPI_RESPONSE_BODY_SIZE {
+        let max_body = self
+            .config
+            .as_ref()
+            .map(|c| (c.crowdsec.lapi.max_body_size_kb as usize).saturating_mul(1024))
+            .unwrap_or(MAX_LAPI_RESPONSE_BODY_SIZE);
+        if body_size > max_body {
+            // The startup flag is only set on success, so this is retried on the next
+            // tick rather than leaving the bouncer permanently without decisions
             log::error!(
-                "LAPI decisions response body too large ({} bytes, max {}), skipping sync",
+                "LAPI decisions response body too large ({} bytes, max {}); no decisions \
+                 applied and IP blocking is inactive until this succeeds. Raise \
+                 lapi.max_body_size_kb if the VM has headroom, or reduce the blocklist",
                 body_size,
-                MAX_LAPI_RESPONSE_BODY_SIZE
+                max_body
             );
             return;
         }
@@ -245,6 +361,12 @@ impl Context for CrowdSecPlugin {
         let new = resp.new.unwrap_or_default();
         let deleted = resp.deleted.unwrap_or_default();
 
+        let now = self
+            .get_current_time()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         let mut v4_add = Vec::new();
         let mut v6_add = Vec::new();
         let mut v4_remove = Vec::new();
@@ -263,20 +385,40 @@ impl Context for CrowdSecPlugin {
                 );
                 continue;
             }
+
+            let ttl_ms = match parse_go_duration_ms(&d.duration) {
+                Some(ms) if ms <= 0 => {
+                    log::debug!("Decision for {} has already elapsed, skipping", d.value);
+                    continue;
+                }
+                Some(ms) => ms,
+                None => {
+                    log::warn!(
+                        "Decision for {} has an unparseable duration {:?}, applying default TTL",
+                        d.value,
+                        d.duration
+                    );
+                    DEFAULT_DECISION_TTL_MS
+                }
+            };
+            let expires_at = now.saturating_add(ttl_ms as u64);
+
             match d.scope.to_lowercase().as_str() {
                 "ip" => {
-                    let key = format!("ip:{}", d.value);
-                    let value = format!("{}_{}", d.decision_type, d.scenario);
-                    let _ = self.set_shared_data(&key, Some(value.as_bytes()), None);
+                    let key = format!("{}{}", IP_DECISION_PREFIX, d.value);
+                    let reason = format!("{}_{}", d.decision_type, d.scenario);
+                    let value = with_expiry(expires_at, reason.as_bytes());
+                    let _ = self.set_shared_data(&key, Some(&value), None);
                     applied += 1;
                 }
                 "range" => match encode_range(&d.value) {
-                    Some((true, record)) => {
-                        v6_add.push(record);
-                        applied += 1;
-                    }
-                    Some((false, record)) => {
-                        v4_add.push(record);
+                    Some((is_v6, cidr)) => {
+                        let record = with_expiry(expires_at, &cidr);
+                        if is_v6 {
+                            v6_add.push(record);
+                        } else {
+                            v4_add.push(record);
+                        }
                         applied += 1;
                     }
                     None => log::warn!("Skipping unparseable range decision: {}", d.value),
@@ -293,20 +435,26 @@ impl Context for CrowdSecPlugin {
         for d in &deleted {
             match d.scope.to_lowercase().as_str() {
                 "ip" => {
-                    let key = format!("ip:{}", d.value);
+                    let key = format!("{}{}", IP_DECISION_PREFIX, d.value);
                     let _ = self.set_shared_data(&key, None, None);
                 }
                 "range" => match encode_range(&d.value) {
-                    Some((true, record)) => v6_remove.push(record),
-                    Some((false, record)) => v4_remove.push(record),
+                    Some((true, cidr)) => v6_remove.push(cidr),
+                    Some((false, cidr)) => v4_remove.push(cidr),
                     None => {}
                 },
                 _ => {}
             }
         }
 
-        self.update_range_blob(RANGES_V4_KEY, RANGE_V4_RECORD, &v4_add, &v4_remove);
-        self.update_range_blob(RANGES_V6_KEY, RANGE_V6_RECORD, &v6_add, &v6_remove);
+        self.update_range_blob(RANGES_V4_KEY, RANGE_V4_RECORD, &v4_add, &v4_remove, now);
+        self.update_range_blob(RANGES_V6_KEY, RANGE_V6_RECORD, &v6_add, &v6_remove, now);
+
+        if self.pending_startup {
+            let _ = self.set_shared_data(STARTUP_DONE_KEY, Some(&[1u8][..]), None);
+            self.pending_startup = false;
+            log::info!("Startup decision pull complete; other workers will sync incrementally");
+        }
 
         log::info!(
             "Synced decisions: +{} new ({} applied), -{} deleted",
@@ -437,9 +585,7 @@ impl RootContext for CrowdSecPlugin {
     }
 
     fn on_tick(&mut self) {
-        // Use first_sync flag to trigger startup=true on first tick
-        self.sync_decisions(self.first_sync);
-        self.first_sync = false;
+        self.sync_decisions();
     }
 
     fn create_http_context(&self, _context_id: u32) -> Option<Box<dyn HttpContext>> {
@@ -450,5 +596,54 @@ impl RootContext for CrowdSecPlugin {
 
     fn get_type(&self) -> Option<ContextType> {
         Some(ContextType::HttpContext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_go_duration_typical_lapi_values() {
+        assert_eq!(parse_go_duration_ms("3h59m57s"), Some(14_397_000));
+        assert_eq!(parse_go_duration_ms("29m57s"), Some(1_797_000));
+        assert_eq!(parse_go_duration_ms("4h"), Some(14_400_000));
+        assert_eq!(parse_go_duration_ms("30m"), Some(1_800_000));
+        assert_eq!(parse_go_duration_ms("90s"), Some(90_000));
+    }
+
+    #[test]
+    fn test_parse_go_duration_negative_means_elapsed() {
+        // LAPI reports already-expired decisions with a negative duration
+        assert_eq!(parse_go_duration_ms("-52m11s"), Some(-3_131_000));
+        assert!(parse_go_duration_ms("-1s").unwrap() < 0);
+    }
+
+    #[test]
+    fn test_parse_go_duration_fractional_and_small_units() {
+        assert_eq!(parse_go_duration_ms("1m30.5s"), Some(90_500));
+        assert_eq!(parse_go_duration_ms("1.5s"), Some(1_500));
+        assert_eq!(parse_go_duration_ms("250ms"), Some(250));
+        assert_eq!(parse_go_duration_ms("3h59m58.123456789s"), Some(14_398_123));
+        assert_eq!(parse_go_duration_ms("500us"), Some(0));
+        assert_eq!(parse_go_duration_ms("500\u{b5}s"), Some(0));
+        assert_eq!(parse_go_duration_ms("1000000ns"), Some(1));
+    }
+
+    #[test]
+    fn test_parse_go_duration_zero() {
+        assert_eq!(parse_go_duration_ms("0"), Some(0));
+        assert_eq!(parse_go_duration_ms("0s"), Some(0));
+    }
+
+    #[test]
+    fn test_parse_go_duration_rejects_garbage() {
+        // Unparseable durations fall back to a bounded default rather than being
+        // treated as permanent, so they must be reported as None not silently zero
+        assert!(parse_go_duration_ms("").is_none());
+        assert!(parse_go_duration_ms("forever").is_none());
+        assert!(parse_go_duration_ms("12").is_none());
+        assert!(parse_go_duration_ms("3d").is_none());
+        assert!(parse_go_duration_ms("h").is_none());
     }
 }
