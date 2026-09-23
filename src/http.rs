@@ -473,30 +473,80 @@ fn patch_csp_for_wasm(value: &str) -> String {
         .map(|p| p.trim())
         .filter(|p| !p.is_empty())
         .collect();
-    let target = if directives
+
+    if directives
         .iter()
         .any(|d| d.split_whitespace().next() == Some("script-src"))
     {
-        "script-src"
-    } else if directives
+        return directives
+            .into_iter()
+            .map(|d| {
+                if d.split_whitespace().next() == Some("script-src") && !d.contains("'unsafe-eval'")
+                {
+                    format!("{d} 'unsafe-eval'")
+                } else {
+                    d.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+    }
+
+    // No script-src: derive one from default-src rather than adding 'unsafe-eval' to
+    // default-src itself, which would loosen every fetch directive that inherits from it
+    // (images, styles, connect, frames) and not just scripts.
+    if let Some(default) = directives
         .iter()
-        .any(|d| d.split_whitespace().next() == Some("default-src"))
+        .find(|d| d.split_whitespace().next() == Some("default-src"))
     {
-        "default-src"
+        let sources = default
+            .split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let script_src = if sources.is_empty() {
+            "script-src 'unsafe-eval'".to_string()
+        } else {
+            format!("script-src {sources} 'unsafe-eval'")
+        };
+        let mut out: Vec<String> = directives.iter().map(|d| d.to_string()).collect();
+        out.push(script_src);
+        return out.join("; ");
+    }
+
+    value.to_string()
+}
+
+/// Status codes a challenge response may set. AppSec is a semi-trusted network peer and
+/// send_http_response relays whatever it is handed, so anything outside the HTTP range
+/// falls back to a plain block rather than being passed through.
+fn sanitize_challenge_status(status: u16) -> u32 {
+    if (100..=599).contains(&status) {
+        status as u32
     } else {
-        return value.to_string();
-    };
-    directives
-        .into_iter()
-        .map(|d| {
-            if d.split_whitespace().next() == Some(target) && !d.contains("'unsafe-eval'") {
-                format!("{d} 'unsafe-eval'")
-            } else {
-                d.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("; ")
+        403
+    }
+}
+
+/// Header names a challenge response may set. AppSec controls both the names and the
+/// values here, so restrict them to what a challenge page legitimately needs instead of
+/// relaying arbitrary names - which would otherwise include pseudo-headers, hop-by-hop
+/// headers, and framing headers that send_http_response sets itself.
+fn is_allowed_challenge_header(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "content-type"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "cache-control"
+            | "pragma"
+            | "expires"
+            | "vary"
+            | "referrer-policy"
+            | "x-content-type-options"
+            | "x-frame-options"
+            | "set-cookie"
+    )
 }
 
 /// Flatten a challenge envelope's user_headers and user_cookies into (name, value) pairs
@@ -505,6 +555,10 @@ fn patch_csp_for_wasm(value: &str) -> String {
 fn build_challenge_headers(envelope: &ChallengeEnvelope) -> Vec<(String, String)> {
     let mut headers = Vec::new();
     for (name, values) in &envelope.user_headers {
+        if !is_allowed_challenge_header(name) {
+            log::warn!("Dropping disallowed challenge header from AppSec: {}", name);
+            continue;
+        }
         for value in values {
             if name.eq_ignore_ascii_case("content-security-policy") {
                 headers.push((name.clone(), patch_csp_for_wasm(value)));
@@ -823,7 +877,7 @@ impl Context for CrowdSecHttpContext {
                     .map(|(name, value)| (name.as_str(), value.as_str()))
                     .collect();
                 self.send_http_response(
-                    challenge.http_status as u32,
+                    sanitize_challenge_status(challenge.http_status),
                     header_refs,
                     Some(challenge.user_body_content.as_bytes()),
                 );
@@ -1661,11 +1715,13 @@ mod tests {
 
     #[test]
     fn test_patch_csp_for_wasm_falls_back_to_default_src() {
+        // default-src is left intact; a script-src is derived from it instead, so
+        // img-src/connect-src/frame-src inheritors are not silently widened
         let csp = "default-src 'self'; style-src 'self'";
         let patched = patch_csp_for_wasm(csp);
         assert_eq!(
             patched,
-            "default-src 'self' 'unsafe-eval'; style-src 'self'"
+            "default-src 'self'; style-src 'self'; script-src 'self' 'unsafe-eval'"
         );
     }
 
@@ -1701,7 +1757,67 @@ mod tests {
         let patched = patch_csp_for_wasm(csp);
         assert_eq!(
             patched,
-            "script-src-elem 'self'; default-src 'self' 'unsafe-eval'"
+            "script-src-elem 'self'; default-src 'self'; script-src 'self' 'unsafe-eval'"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_challenge_status_passes_valid_codes() {
+        assert_eq!(sanitize_challenge_status(200), 200);
+        assert_eq!(sanitize_challenge_status(403), 403);
+        assert_eq!(sanitize_challenge_status(599), 599);
+        assert_eq!(sanitize_challenge_status(100), 100);
+    }
+
+    #[test]
+    fn test_sanitize_challenge_status_rejects_out_of_range() {
+        // send_http_response relays whatever it is handed, so a semi-trusted peer must
+        // not be able to set an out-of-range status on the client's response.
+        assert_eq!(sanitize_challenge_status(0), 403);
+        assert_eq!(sanitize_challenge_status(99), 403);
+        assert_eq!(sanitize_challenge_status(600), 403);
+        assert_eq!(sanitize_challenge_status(65535), 403);
+    }
+
+    #[test]
+    fn test_is_allowed_challenge_header() {
+        assert!(is_allowed_challenge_header("Content-Type"));
+        assert!(is_allowed_challenge_header("content-security-policy"));
+        assert!(is_allowed_challenge_header("Set-Cookie"));
+        // Framing, hop-by-hop and pseudo-headers must never be relayed
+        assert!(!is_allowed_challenge_header("content-length"));
+        assert!(!is_allowed_challenge_header("transfer-encoding"));
+        assert!(!is_allowed_challenge_header("connection"));
+        assert!(!is_allowed_challenge_header(":status"));
+        assert!(!is_allowed_challenge_header("location"));
+    }
+
+    #[test]
+    fn test_build_challenge_headers_drops_disallowed_names() {
+        let mut user_headers = HashMap::new();
+        user_headers.insert("Content-Type".to_string(), vec!["text/html".to_string()]);
+        user_headers.insert("Content-Length".to_string(), vec!["999".to_string()]);
+        user_headers.insert(":status".to_string(), vec!["200".to_string()]);
+        user_headers.insert("Connection".to_string(), vec!["close".to_string()]);
+        let envelope = ChallengeEnvelope {
+            action: "challenge".to_string(),
+            http_status: 200,
+            user_body_content: String::new(),
+            user_headers,
+            user_cookies: vec![],
+        };
+        let headers = build_challenge_headers(&envelope);
+        assert_eq!(
+            headers,
+            vec![("Content-Type".to_string(), "text/html".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_patch_csp_for_wasm_derives_script_src_from_bare_default_src() {
+        assert_eq!(
+            patch_csp_for_wasm("default-src"),
+            "default-src; script-src 'unsafe-eval'"
         );
     }
 

