@@ -117,6 +117,36 @@ assert_log_contains() {
     fi
 }
 
+assert_equals() {
+    local description="$1"
+    local expected="$2"
+    local actual="$3"
+    TOTAL=$((TOTAL + 1))
+
+    if [ "$actual" = "$expected" ]; then
+        echo -e "${GREEN}PASS${NC} [$actual] $description"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}FAIL${NC} [$actual expected $expected] $description"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_at_least() {
+    local description="$1"
+    local minimum="$2"
+    local actual="$3"
+    TOTAL=$((TOTAL + 1))
+
+    if [ "$actual" -ge "$minimum" ] 2>/dev/null; then
+        echo -e "${GREEN}PASS${NC} [$actual >= $minimum] $description"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}FAIL${NC} [$actual expected >= $minimum] $description"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 cscli() {
     docker compose exec -T crowdsec cscli "$@" >/dev/null 2>&1 || true
 }
@@ -477,6 +507,11 @@ cscli decisions delete --all
 cscli decisions add -i 9.9.9.9 -d 2h -t ban -R integration/xff-test
 cscli decisions add -r 9.9.8.0/24 -d 2h -t ban -R integration/range-test
 
+# Recreated so the log window below covers exactly one boot, and so shared data starts
+# empty. Without this the startup-sync count is measured against logs that docker keeps
+# across restarts, and a time-filtered window can clip the boot lines instead.
+docker compose up -d --force-recreate envoy-lapi >/dev/null 2>&1 || true
+
 lapi_ready=0
 for i in $(seq 1 60); do
     if curl -sf -o /dev/null "$ENVOY_LAPI_URL/get" 2>/dev/null; then
@@ -520,7 +555,35 @@ else
         -H "X-Forwarded-For: 9.9.7.77" \
         "$ENVOY_LAPI_URL/get"
 
+    # Each worker thread runs its own WASM VM with its own copy of every struct field,
+    # so a per-instance "first sync" flag meant all of them pulled the entire decision
+    # set - eight full syncs on an eight-core proxy. The flag lives in shared data now.
+    lapi_logs=$(docker compose logs envoy-lapi 2>/dev/null || true)
+    vm_count=$(printf '%s\n' "$lapi_logs" | grep -c "CrowdSec Plugin loading" || true)
+    startup_syncs=$(printf '%s\n' "$lapi_logs" | grep -c "starting sync (startup=true)" || true)
+    echo "  (envoy-lapi VM instances this boot: $vm_count, startup syncs: $startup_syncs)"
+
+    # Precondition: with a single VM, "one startup sync" would prove nothing at all
+    assert_at_least "envoy-lapi runs more than one worker VM (precondition)" 2 "$vm_count"
+    assert_equals "Exactly one full startup sync across all worker VMs" 1 "$startup_syncs"
+
+    # A decision must stop being enforced at its own expiry even when the delete
+    # notification never arrives. Isolated by stopping crowdsec, so nothing can clear it
+    # except its lifetime running out. Without a stored expiry this IP stayed banned
+    # forever, because a missed delete was unrecoverable.
     cscli decisions delete --all
+    cscli decisions add -i 7.7.7.7 -d 30s -t ban -R integration/ttl-test
+    sleep 13
+    assert_status "Short-lived ban is enforced while live" 403 \
+        -H "X-Forwarded-For: 7.7.7.7" \
+        "$ENVOY_LAPI_URL/get"
+
+    docker compose stop crowdsec >/dev/null 2>&1 || true
+    sleep 28
+    assert_status "Ban self-expires with LAPI down and no delete received" 200 \
+        -H "X-Forwarded-For: 7.7.7.7" \
+        "$ENVOY_LAPI_URL/get"
+    docker compose start crowdsec >/dev/null 2>&1 || true
 fi
 echo ""
 

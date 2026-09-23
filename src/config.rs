@@ -25,6 +25,11 @@ pub struct LAPIConfig {
     pub sync_freq: u32, // seconds, default 10
     #[serde(default = "default_true")]
     pub enabled: bool,
+    // Cap on the decisions-stream body read per sync. Bounds VM memory against a huge
+    // blocklist: the raw body and the parsed decisions are both live at once, so peak
+    // usage is roughly twice this. Raising it needs headroom in the WASM VM.
+    #[serde(default = "default_max_lapi_body_size_kb")]
+    pub max_body_size_kb: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -60,6 +65,10 @@ fn default_true() -> bool {
 
 fn default_max_body_size_kb() -> u32 {
     8
+}
+
+fn default_max_lapi_body_size_kb() -> u32 {
+    32 * 1024
 }
 
 fn default_max_response_body_size_kb() -> u32 {

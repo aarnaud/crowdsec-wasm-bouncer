@@ -3,17 +3,55 @@ use proxy_wasm::types::*;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
+use std::time::UNIX_EPOCH;
 
 use crate::config::Config;
 
 /// Shared-data keys holding the packed CIDR blobs synced from LAPI `Range` decisions.
-/// Records are fixed-width big-endian (base, mask) pairs. Fixed-width packing keeps the
-/// per-request match a tight masking loop with no string parsing on the hot path.
-pub(crate) const RANGES_V4_KEY: &str = "crowdsec_ranges_v4";
-pub(crate) const RANGES_V6_KEY: &str = "crowdsec_ranges_v6";
+/// Records are fixed-width and big-endian: an expiry, then a (base, mask) pair. Fixed
+/// widths keep the per-request match a tight masking loop with no string parsing on the
+/// hot path.
+///
+/// The `_v2` suffix is deliberate. Shared data outlives any single WASM VM and every
+/// worker thread runs its own instance, so during a rolling update a new-format reader
+/// can meet an old-format blob. Reading 8-byte records as 16-byte ones would silently
+/// block the wrong addresses; a new key means stale blobs are ignored and rebuilt.
+pub(crate) const RANGES_V4_KEY: &str = "crowdsec_ranges_v4_2";
+pub(crate) const RANGES_V6_KEY: &str = "crowdsec_ranges_v6_2";
 
-pub(crate) const RANGE_V4_RECORD: usize = 8;
-pub(crate) const RANGE_V6_RECORD: usize = 32;
+/// Key prefix for exact-IP decisions. Versioned for the same reason as the range keys:
+/// the stored value gained an expiry prefix.
+pub(crate) const IP_DECISION_PREFIX: &str = "ip2:";
+
+/// Every stored decision starts with its expiry as big-endian epoch millis
+pub(crate) const EXPIRY_LEN: usize = 8;
+
+pub(crate) const RANGE_V4_CIDR_LEN: usize = 8;
+pub(crate) const RANGE_V6_CIDR_LEN: usize = 32;
+pub(crate) const RANGE_V4_RECORD: usize = EXPIRY_LEN + RANGE_V4_CIDR_LEN;
+pub(crate) const RANGE_V6_RECORD: usize = EXPIRY_LEN + RANGE_V6_CIDR_LEN;
+
+/// Split a stored decision into its expiry and payload.
+///
+/// Decisions carry their own lifetime, and honouring it is what stops a missed `deleted`
+/// notification from banning an address forever: the entry simply stops matching when
+/// the ban would have ended anyway.
+pub(crate) fn split_expiry(value: &[u8]) -> Option<(u64, &[u8])> {
+    if value.len() < EXPIRY_LEN {
+        return None;
+    }
+    let (head, rest) = value.split_at(EXPIRY_LEN);
+    let bytes: [u8; EXPIRY_LEN] = head.try_into().ok()?;
+    Some((u64::from_be_bytes(bytes), rest))
+}
+
+/// Prefix a payload with its expiry for storage.
+pub(crate) fn with_expiry(expires_at: u64, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(EXPIRY_LEN + payload.len());
+    out.extend_from_slice(&expires_at.to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
 
 /// Cap on the client headers relayed to AppSec, bounding VM memory per in-flight request
 const MAX_FORWARDED_HEADER_BYTES: usize = 8 * 1024;
@@ -202,8 +240,9 @@ fn resolve_client_ip(source_ip: &str, xff: Option<&str>, trusted: &[String]) -> 
     Some(source_ip.to_string())
 }
 
-/// Pack a CIDR into the fixed-width record used in the shared-data range blobs.
-/// Returns (is_ipv6, record) with the base pre-masked so matching is a single AND.
+/// Pack a CIDR into the fixed-width key used inside the shared-data range blobs.
+/// Returns (is_ipv6, key) with the base pre-masked so matching is a single AND.
+/// The caller prepends the expiry to form a full record.
 pub(crate) fn encode_range(cidr: &str) -> Option<(bool, Vec<u8>)> {
     let (base, prefix) = match cidr.find('/') {
         Some(slash) => (&cidr[..slash], Some(cidr[slash + 1..].parse::<u32>().ok()?)),
@@ -220,7 +259,7 @@ pub(crate) fn encode_range(cidr: &str) -> Option<(bool, Vec<u8>)> {
         } else {
             !0u32 << (32 - prefix)
         };
-        let mut record = Vec::with_capacity(RANGE_V4_RECORD);
+        let mut record = Vec::with_capacity(RANGE_V4_CIDR_LEN);
         record.extend_from_slice(&(addr & mask).to_be_bytes());
         record.extend_from_slice(&mask.to_be_bytes());
         return Some((false, record));
@@ -236,7 +275,7 @@ pub(crate) fn encode_range(cidr: &str) -> Option<(bool, Vec<u8>)> {
         } else {
             !0u128 << (128 - prefix)
         };
-        let mut record = Vec::with_capacity(RANGE_V6_RECORD);
+        let mut record = Vec::with_capacity(RANGE_V6_CIDR_LEN);
         record.extend_from_slice(&(addr & mask).to_be_bytes());
         record.extend_from_slice(&mask.to_be_bytes());
         return Some((true, record));
@@ -259,10 +298,17 @@ fn format_v6(addr: u128) -> String {
 
 /// Scan a packed range blob for a CIDR containing `ip`, returning it in CIDR notation
 /// for the block log.
-fn match_v4_range(ip: u32, blob: &[u8]) -> Option<String> {
+fn match_v4_range(ip: u32, blob: &[u8], now: u64) -> Option<String> {
     for record in blob.as_chunks::<RANGE_V4_RECORD>().0 {
-        let base = u32::from_be_bytes([record[0], record[1], record[2], record[3]]);
-        let mask = u32::from_be_bytes([record[4], record[5], record[6], record[7]]);
+        let (expires_at, cidr) = match split_expiry(record) {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if expires_at <= now {
+            continue;
+        }
+        let base = u32::from_be_bytes([cidr[0], cidr[1], cidr[2], cidr[3]]);
+        let mask = u32::from_be_bytes([cidr[4], cidr[5], cidr[6], cidr[7]]);
         if (ip & mask) == base {
             return Some(format!("{}/{}", format_v4(base), mask.leading_ones()));
         }
@@ -270,12 +316,19 @@ fn match_v4_range(ip: u32, blob: &[u8]) -> Option<String> {
     None
 }
 
-fn match_v6_range(ip: u128, blob: &[u8]) -> Option<String> {
+fn match_v6_range(ip: u128, blob: &[u8], now: u64) -> Option<String> {
     for record in blob.as_chunks::<RANGE_V6_RECORD>().0 {
+        let (expires_at, cidr) = match split_expiry(record) {
+            Some(parts) => parts,
+            None => continue,
+        };
+        if expires_at <= now {
+            continue;
+        }
         let mut base_bytes = [0u8; 16];
         let mut mask_bytes = [0u8; 16];
-        base_bytes.copy_from_slice(&record[..16]);
-        mask_bytes.copy_from_slice(&record[16..]);
+        base_bytes.copy_from_slice(&cidr[..16]);
+        mask_bytes.copy_from_slice(&cidr[16..]);
         let base = u128::from_be_bytes(base_bytes);
         let mask = u128::from_be_bytes(mask_bytes);
         if (ip & mask) == base {
@@ -778,16 +831,25 @@ impl CrowdSecHttpContext {
 
     /// Check the client IP against both the per-IP decisions and the synced CIDR ranges.
     fn is_ip_blocked(&self) -> bool {
-        let key = format!("ip:{}", self.ip);
+        // A failed clock read yields 0, which makes every decision look unexpired. That
+        // over-blocks rather than under-blocks, which is the safe direction for a ban.
+        let now = self.now_millis();
+        let key = format!("{}{}", IP_DECISION_PREFIX, self.ip);
         let (decision_data, _) = self.get_shared_data(&key);
         if let Some(decision) = decision_data {
-            if !decision.is_empty() {
-                log::warn!(
-                    "Blocking IP {}: {}",
-                    self.ip,
-                    String::from_utf8_lossy(&decision)
-                );
-                return true;
+            if let Some((expires_at, reason)) = split_expiry(&decision) {
+                if expires_at > now {
+                    log::warn!(
+                        "Blocking IP {}: {}",
+                        self.ip,
+                        String::from_utf8_lossy(reason)
+                    );
+                    return true;
+                }
+                // Removal is left to the sync path, which is the single writer under the
+                // sync lock. Cleaning up here would mean every worker thread issuing CAS
+                // writes to shared data on the request hot path.
+                log::debug!("Decision for IP {} has expired, ignoring", self.ip);
             }
         }
         // Range-scope decisions are stored as packed CIDR blobs rather than per-IP keys.
@@ -801,15 +863,23 @@ impl CrowdSecHttpContext {
     }
 
     fn matched_banned_range(&self) -> Option<String> {
+        let now = self.now_millis();
         if let Some(ip) = parse_ipv4(&self.ip) {
             let (blob, _) = self.get_shared_data(RANGES_V4_KEY);
-            return blob.and_then(|b| match_v4_range(ip, &b));
+            return blob.and_then(|b| match_v4_range(ip, &b, now));
         }
         if let Some(ip) = parse_ipv6(&self.ip) {
             let (blob, _) = self.get_shared_data(RANGES_V6_KEY);
-            return blob.and_then(|b| match_v6_range(ip, &b));
+            return blob.and_then(|b| match_v6_range(ip, &b, now));
         }
         None
+    }
+
+    fn now_millis(&self) -> u64 {
+        self.get_current_time()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -1316,7 +1386,7 @@ mod tests {
     fn test_encode_range_ipv4_masks_base() {
         let (is_v6, record) = encode_range("192.168.1.55/24").expect("should encode");
         assert!(!is_v6);
-        assert_eq!(record.len(), RANGE_V4_RECORD);
+        assert_eq!(record.len(), RANGE_V4_CIDR_LEN);
         // Base is stored pre-masked so matching is a single AND
         assert_eq!(&record[..4], &[192, 168, 1, 0]);
         assert_eq!(&record[4..], &[255, 255, 255, 0]);
@@ -1332,7 +1402,7 @@ mod tests {
     fn test_encode_range_ipv6() {
         let (is_v6, record) = encode_range("2001:db8::/32").expect("should encode");
         assert!(is_v6);
-        assert_eq!(record.len(), RANGE_V6_RECORD);
+        assert_eq!(record.len(), RANGE_V6_CIDR_LEN);
     }
 
     #[test]
@@ -1344,33 +1414,68 @@ mod tests {
         assert!(encode_range("").is_none());
     }
 
+    /// Build a blob record that is live well past `now`
+    fn live_range(cidr: &str) -> Vec<u8> {
+        let (_, key) = encode_range(cidr).expect("should encode");
+        with_expiry(10_000, &key)
+    }
+
     #[test]
     fn test_match_v4_range_hit_and_miss() {
-        let (_, a) = encode_range("192.168.0.0/16").unwrap();
-        let (_, b) = encode_range("10.0.0.0/8").unwrap();
-        let blob: Vec<u8> = [a, b].concat();
+        let blob: Vec<u8> = [live_range("192.168.0.0/16"), live_range("10.0.0.0/8")].concat();
 
         assert_eq!(
-            match_v4_range(parse_ipv4("10.5.6.7").unwrap(), &blob),
+            match_v4_range(parse_ipv4("10.5.6.7").unwrap(), &blob, 1_000),
             Some("10.0.0.0/8".to_string())
         );
         assert_eq!(
-            match_v4_range(parse_ipv4("192.168.99.1").unwrap(), &blob),
+            match_v4_range(parse_ipv4("192.168.99.1").unwrap(), &blob, 1_000),
             Some("192.168.0.0/16".to_string())
         );
-        assert!(match_v4_range(parse_ipv4("172.16.0.1").unwrap(), &blob).is_none());
+        assert!(match_v4_range(parse_ipv4("172.16.0.1").unwrap(), &blob, 1_000).is_none());
     }
 
     #[test]
     fn test_match_v4_range_empty_blob() {
-        assert!(match_v4_range(parse_ipv4("10.0.0.1").unwrap(), &[]).is_none());
+        assert!(match_v4_range(parse_ipv4("10.0.0.1").unwrap(), &[], 1_000).is_none());
+    }
+
+    #[test]
+    fn test_match_v4_range_ignores_expired_record() {
+        // A missed `deleted` notification must not keep a range banned forever: the
+        // record stops matching once the decision's own lifetime has run out.
+        let blob = live_range("10.0.0.0/8");
+        let ip = parse_ipv4("10.5.6.7").unwrap();
+        assert!(match_v4_range(ip, &blob, 9_999).is_some());
+        assert!(match_v4_range(ip, &blob, 10_000).is_none());
+        assert!(match_v4_range(ip, &blob, 10_001).is_none());
     }
 
     #[test]
     fn test_match_v6_range_hit_and_miss() {
-        let (_, record) = encode_range("2001:db8::/32").unwrap();
-        assert!(match_v6_range(parse_ipv6("2001:db8::dead:beef").unwrap(), &record).is_some());
-        assert!(match_v6_range(parse_ipv6("2001:db9::1").unwrap(), &record).is_none());
+        let record = live_range("2001:db8::/32");
+        assert!(
+            match_v6_range(parse_ipv6("2001:db8::dead:beef").unwrap(), &record, 1_000).is_some()
+        );
+        assert!(match_v6_range(parse_ipv6("2001:db9::1").unwrap(), &record, 1_000).is_none());
+        // Expired
+        assert!(
+            match_v6_range(parse_ipv6("2001:db8::dead:beef").unwrap(), &record, 20_000).is_none()
+        );
+    }
+
+    #[test]
+    fn test_split_and_with_expiry_roundtrip() {
+        let stored = with_expiry(1_700_000_000_000, b"ban_crowdsecurity/http-probing");
+        let (expires_at, payload) = split_expiry(&stored).expect("should split");
+        assert_eq!(expires_at, 1_700_000_000_000);
+        assert_eq!(payload, b"ban_crowdsecurity/http-probing");
+    }
+
+    #[test]
+    fn test_split_expiry_rejects_short_value() {
+        assert!(split_expiry(b"").is_none());
+        assert!(split_expiry(b"short").is_none());
     }
 
     #[test]
