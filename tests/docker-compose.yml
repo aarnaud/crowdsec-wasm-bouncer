@@ -1,21 +1,32 @@
 services:
   crowdsec:
-    image: crowdsecurity/crowdsec:v1.8.1
+    image: crowdsecurity/crowdsec:latest
     environment:
       COLLECTIONS: "crowdsecurity/appsec-generic-rules crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-crs crowdsecurity/appsec-crs-inband crowdsecurity/appsec-bot-challenge"
       BOUNCER_KEY_envoy: "test-bouncer-key"
       DISABLE_PARSERS: "crowdsecurity/whitelists"
-      APPSEC_CONFIGS: "crowdsecurity/appsec-default crowdsecurity/appsec-bot-challenge-scoring-balanced"
+      APPSEC_CONFIGS: "crowdsecurity/appsec-default"
     volumes:
       - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml
       - ./crowdsec/appsec-configs:/etc/crowdsec/appsec-configs
       - crowdsec-db:/var/lib/crowdsec/data/
       - crowdsec-config:/etc/crowdsec/
     healthcheck:
-      test: ["CMD", "cscli", "version"]
+      # cscli version alone only proves the LAPI is answering, not that the AppSec
+      # engine has finished loading its rule collections - it keeps listening on 7422
+      # and returning 503 for a real window after that (measured ~50s locally with warm
+      # image layers; a fresh/CPU-constrained CI runner compiling CRS's regexes can take
+      # noticeably longer). Every envoy-* service gates its own startup on this
+      # healthcheck, and with fail_open: false a request that lands in that window is a
+      # hard 403 - which is indistinguishable from "not ready" to run_tests.sh's own
+      # readiness probe, and is the direct cause of a "Waiting for Envoy to be ready"
+      # timeout in CI. A bare unauthenticated request to the AppSec port is a stable,
+      # protocol-level signal that the engine is actually serving: it reliably returns
+      # 401 once ready, regardless of which collections are loaded.
+      test: ["CMD-SHELL", "cscli version >/dev/null 2>&1 && wget -q -S -O /dev/null http://localhost:7422/ 2>&1 | grep -q '401 Unauthorized'"]
       interval: 5s
       timeout: 5s
-      retries: 30
+      retries: 60
 
   backend:
     image: mccutchen/go-httpbin:latest

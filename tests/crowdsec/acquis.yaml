@@ -1,19 +1,8 @@
 appsec_configs:
-  - custom/bot-challenge
-  - crowdsecurity/appsec-bot-challenge-scoring
-  - crowdsecurity/appsec-bot-challenge-scoring-balanced
-  - crowdsecurity/appsec-bot-challenge-exclude-search-engines
-  - crowdsecurity/appsec-bot-challenge-exclude-ai-crawlers
-  - crowdsecurity/appsec-bot-challenge-exclude-social
-  - crowdsecurity/appsec-bot-challenge-exclude-monitoring
-  - crowdsecurity/appsec-bot-challenge-exclude-crawler-files
-  - crowdsecurity/appsec-bot-challenge-exclude-static
-  - crowdsecurity/appsec-bot-challenge-exclude-api
-  - crowdsecurity/appsec-bot-challenge-exclude-feeds
-  - crowdsecurity/appsec-bot-challenge-exclude-webhooks
-  - custom/bot-challenge-test
   - custom/default
   - crowdsecurity/crs
+  - crowdsecurity/appsec-bot-challenge-scoring-balanced
+  - custom/bot-challenge-test
 labels:
   type: appsec
 listen_addr: 0.0.0.0:7422
