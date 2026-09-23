@@ -43,6 +43,6 @@ docker-down:
 
 # Integration tests
 integration-test: crowdsec_wasm_bouncer.wasm docker-up
-	cd tests && docker compose restart envoy envoy-async envoy-failopen envoy-lapi
+	cd tests && docker compose restart envoy envoy-async envoy-failopen envoy-lapi envoy-slowappsec
 	@sleep 2
 	cd tests && bash run_tests.sh; ret=$$?; exit $$ret
