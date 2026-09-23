@@ -1,11 +1,11 @@
 services:
   crowdsec:
-    image: crowdsecurity/crowdsec:latest
+    image: crowdsecurity/crowdsec:v1.8.1
     environment:
       COLLECTIONS: "crowdsecurity/appsec-generic-rules crowdsecurity/appsec-virtual-patching crowdsecurity/appsec-crs crowdsecurity/appsec-crs-inband crowdsecurity/appsec-bot-challenge"
       BOUNCER_KEY_envoy: "test-bouncer-key"
       DISABLE_PARSERS: "crowdsecurity/whitelists"
-      APPSEC_CONFIGS: "crowdsecurity/appsec-default"
+      APPSEC_CONFIGS: "crowdsecurity/appsec-default crowdsecurity/appsec-bot-challenge-scoring-balanced"
     volumes:
       - ./crowdsec/acquis.yaml:/etc/crowdsec/acquis.yaml
       - ./crowdsec/appsec-configs:/etc/crowdsec/appsec-configs

