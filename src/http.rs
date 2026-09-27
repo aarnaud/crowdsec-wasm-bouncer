@@ -414,7 +414,7 @@ fn body_is_inspectable(content_type: &str) -> bool {
         || media.ends_with("+xml")
 }
 
-/// Does this body prefix actually look like binary? Three signals, any of which is
+/// Does this body actually look like binary? Three signals, any of which is
 /// conclusive on its own for the encrypted/compressed/image payloads this exists to
 /// spare from a text-oriented WAF:
 ///
@@ -427,31 +427,55 @@ fn body_is_inspectable(content_type: &str) -> bool {
 ///
 /// Deliberately *not* a UTF-8 validity check: that would let a single stray 0xff byte
 /// appended to a text payload turn the skip back into a one-byte bypass.
-fn looks_binary(prefix: &[u8]) -> bool {
-    if prefix.is_empty() {
+///
+/// Inspects the whole slice handed to it, not a fixed-size prefix: a short ASCII/hex
+/// preamble (e.g. the chunk-size/signature framing an S3-style "aws-chunked" upload
+/// puts ahead of each block of raw object bytes) dilutes a small fixed sample below
+/// the thresholds even though the bulk of the buffered body is genuinely binary. The
+/// caller already bounds the buffer size via max_body_size_kb, so scanning all of it
+/// costs nothing extra.
+fn looks_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
         return false;
     }
-    let sample = &prefix[..prefix.len().min(SNIFF_PREFIX)];
-    if sample.contains(&0) {
+    if bytes.contains(&0) {
         return true;
     }
-    let len = sample.len();
-    let control = sample
+    let len = bytes.len();
+    let control = bytes
         .iter()
         .filter(|b| **b < 0x09 || (**b > 0x0d && **b < 0x20) || **b == 0x7f)
         .count();
-    let non_ascii = sample.iter().filter(|b| **b >= 0x80).count();
+    let non_ascii = bytes.iter().filter(|b| **b >= 0x80).count();
     control * 100 > len * 30 || (non_ascii * 100 > len * 40 && control * 100 > len * 5)
+}
+
+/// True when Content-Encoding declares a transformation this filter cannot undo.
+///
+/// There is no decompression codec available in this WASM filter, so for an encoded
+/// body the bytes on the wire are not the literal request content. Trusting the
+/// declared Content-Type for such a body, the way body_is_inspectable does, would
+/// have AppSec parse compressed/ciphertext noise as if it were real JSON/form data -
+/// exactly how a gzip or "aws-chunked" streaming upload turns into bogus WAF matches.
+fn is_undecodable_encoding(content_encoding: &str) -> bool {
+    let enc = content_encoding.trim();
+    !enc.is_empty() && !enc.eq_ignore_ascii_case("identity")
 }
 
 /// Whether the buffered body should go to AppSec.
 ///
-/// The declared Content-Type only gets to *exclude* a body, and only when the bytes
-/// agree with it. Content-Type is attacker-controlled, so trusting it alone turns
-/// "skip binary uploads" into a one-header WAF bypass: a JSON injection payload sent as
-/// `application/octet-stream` would never be inspected, while plenty of backends parse
-/// the body regardless of what it claims to be.
-fn should_forward_body(content_type: &str, prefix: &[u8]) -> bool {
+/// An undecodable Content-Encoding rules a body out unconditionally, since neither
+/// the declared Content-Type nor the byte sniff below can be trusted against bytes
+/// this filter cannot decompress. Otherwise, the declared Content-Type only gets to
+/// *exclude* a body, and only when the bytes agree with it. Content-Type is
+/// attacker-controlled, so trusting it alone turns "skip binary uploads" into a
+/// one-header WAF bypass: a JSON injection payload sent as `application/octet-stream`
+/// would never be inspected, while plenty of backends parse the body regardless of
+/// what it claims to be.
+fn should_forward_body(content_type: &str, content_encoding: &str, prefix: &[u8]) -> bool {
+    if is_undecodable_encoding(content_encoding) {
+        return false;
+    }
     body_is_inspectable(content_type) || !looks_binary(prefix)
 }
 
@@ -634,6 +658,7 @@ pub struct CrowdSecHttpContext {
     host: String,
     user_agent: String,
     content_type: String,
+    content_encoding: String,
     client_headers: Vec<(String, String)>,
     body_data: Vec<u8>,
     has_body: bool,
@@ -654,6 +679,7 @@ impl CrowdSecHttpContext {
             host: String::new(),
             user_agent: String::new(),
             content_type: String::new(),
+            content_encoding: String::new(),
             client_headers: Vec::new(),
             body_data: Vec::new(),
             has_body: false,
@@ -771,10 +797,10 @@ impl CrowdSecHttpContext {
             return;
         }
         self.body_decided = true;
-        if !should_forward_body(&self.content_type, &self.body_data) {
+        if !should_forward_body(&self.content_type, &self.content_encoding, &self.body_data) {
             log::info!(
-                "Body bytes look binary (content-type: {}), headers-only AppSec check",
-                self.content_type
+                "Body not forwarded (content-type: {}, content-encoding: {}), headers-only AppSec check",
+                self.content_type, self.content_encoding
             );
             self.body_skipped = true;
             self.body_data.clear();
@@ -1044,6 +1070,9 @@ impl HttpContext for CrowdSecHttpContext {
         self.client_headers = collect_client_headers(self.get_http_request_headers());
         self.content_type = self
             .get_http_request_header("content-type")
+            .unwrap_or_default();
+        self.content_encoding = self
+            .get_http_request_header("content-encoding")
             .unwrap_or_default();
 
         let content_length = self
@@ -1631,16 +1660,17 @@ mod tests {
 
     #[test]
     fn test_should_forward_body_honours_declared_text_type() {
-        assert!(should_forward_body("application/json", br#"{"a":1}"#));
+        assert!(should_forward_body("application/json", "", br#"{"a":1}"#));
     }
 
     #[test]
     fn test_should_forward_body_skips_genuine_binary() {
         assert!(!should_forward_body(
             "application/octet-stream",
+            "",
             b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
         ));
-        assert!(!should_forward_body("image/png", &[0u8; 128]));
+        assert!(!should_forward_body("image/png", "", &[0u8; 128]));
     }
 
     #[test]
@@ -1649,17 +1679,66 @@ mod tests {
         // injection payload, and the body used to skip inspection entirely.
         assert!(should_forward_body(
             "application/octet-stream",
+            "",
             br#"{"q":"1' UNION SELECT password FROM users--"}"#
         ));
         assert!(should_forward_body(
             "image/png",
+            "",
             b"<script>alert(document.cookie)</script>"
         ));
     }
 
     #[test]
     fn test_should_forward_body_empty_body_is_not_binary() {
-        assert!(should_forward_body("application/octet-stream", b""));
+        assert!(should_forward_body("application/octet-stream", "", b""));
+    }
+
+    #[test]
+    fn test_should_forward_body_skips_undecodable_encoding() {
+        // A declared-text body under an encoding we cannot decompress must never be
+        // forwarded, even though Content-Type alone would call it inspectable - the
+        // bytes on the wire are not the literal JSON/form content they claim to be.
+        assert!(!should_forward_body(
+            "application/json",
+            "gzip",
+            br#"{"a":1}"#
+        ));
+        assert!(!should_forward_body(
+            "application/json",
+            "aws-chunked",
+            br#"{"a":1}"#
+        ));
+        // "identity" and no header at all are pass-through, not an encoding
+        assert!(should_forward_body(
+            "application/json",
+            "identity",
+            br#"{"a":1}"#
+        ));
+        assert!(should_forward_body("application/json", "", br#"{"a":1}"#));
+    }
+
+    #[test]
+    fn test_looks_binary_detects_binary_after_text_preamble() {
+        // Reproduces the alert-15999 false negative: an S3/MinIO "aws-chunked"
+        // streaming upload prefixes each block of raw object bytes with an ASCII
+        // chunk-size/signature line. A sniff limited to a small fixed prefix sees
+        // mostly that text and misses the binary payload that follows it.
+        let preamble =
+            b"2000;chunk-signature=1234567890abcdef1234567890abcdef1234567890ab\r\n".repeat(5);
+        let mut body = preamble.to_vec();
+        let entropy: Vec<u8> = (0..8192u32)
+            .map(|i| {
+                let v = (i.wrapping_mul(2654435761) >> 13) as u8;
+                if v == 0 {
+                    1
+                } else {
+                    v
+                }
+            })
+            .collect();
+        body.extend_from_slice(&entropy);
+        assert!(looks_binary(&body));
     }
 
     #[test]
