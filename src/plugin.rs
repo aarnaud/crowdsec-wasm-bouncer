@@ -196,7 +196,10 @@ impl CrowdSecPlugin {
             (":path", path),
             (":authority", ""),
             ("X-Api-Key", &config.crowdsec.lapi.key),
-            ("user-agent", "crowdsec-wasm-bouncer"),
+            (
+                "user-agent",
+                concat!("crowdsec-wasm-bouncer/v", env!("CARGO_PKG_VERSION")),
+            ),
         ];
 
         match self.dispatch_http_call(
