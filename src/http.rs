@@ -393,10 +393,13 @@ fn collect_client_headers(headers: Vec<(String, String)>) -> Vec<(String, String
 /// (headers-only AppSec check) rather than forwarding, since raw binary noise scores as
 /// highly anomalous under signature-based WAF rules and can trigger false-positive bans
 /// on legitimate uploads.
+///
+/// A missing Content-Type is deliberately *not* treated as inspectable: should_forward_body
+/// ORs this with the byte sniff, so returning true here would skip that sniff entirely
+/// for every content-type-less body. Plenty of raw-upload clients (S3/MinIO multipart
+/// UploadPart in particular) send binary object bytes with no Content-Type header at
+/// all - falling through to the byte sniff is what actually catches those.
 fn body_is_inspectable(content_type: &str) -> bool {
-    if content_type.is_empty() {
-        return true;
-    }
     let ct = content_type.to_lowercase();
     let media = ct.split(';').next().unwrap_or("").trim();
     matches!(
@@ -1577,8 +1580,11 @@ mod tests {
     }
 
     #[test]
-    fn test_body_is_inspectable_empty_content_type() {
-        assert!(body_is_inspectable(""));
+    fn test_body_is_inspectable_empty_content_type_defers_to_byte_sniff() {
+        // No Content-Type must not short-circuit should_forward_body's OR past the
+        // byte sniff - plenty of raw-upload clients (S3/MinIO UploadPart) send binary
+        // object bytes with no Content-Type header at all.
+        assert!(!body_is_inspectable(""));
     }
 
     #[test]
@@ -1692,6 +1698,16 @@ mod tests {
     #[test]
     fn test_should_forward_body_empty_body_is_not_binary() {
         assert!(should_forward_body("application/octet-stream", "", b""));
+    }
+
+    #[test]
+    fn test_should_forward_body_no_content_type_still_checked_for_binary() {
+        // Reproduces alert 16009: an S3/MinIO UploadPart PUT with no Content-Type
+        // header at all, carrying raw binary object bytes. body_is_inspectable("")
+        // must not wave this through unconditionally - the byte sniff has to run.
+        assert!(!should_forward_body("", "", &[0u8; 128]));
+        // A genuinely textual body with no declared type is still forwarded.
+        assert!(should_forward_body("", "", br#"{"a":1}"#));
     }
 
     #[test]
