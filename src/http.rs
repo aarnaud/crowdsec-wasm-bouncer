@@ -365,6 +365,25 @@ fn is_forwardable_header(name: &str) -> bool {
     )
 }
 
+/// Whether this request is an HTTP protocol-upgrade handshake (WebSocket being the
+/// common case). RFC 7230 requires both signals: Connection listing the "upgrade"
+/// token, and a non-empty Upgrade header naming the target protocol. A genuine
+/// handshake carries no body of its own - real protocol frames (WebSocket included)
+/// only start flowing after the server's 101 response - so there is nothing here for a
+/// body-based WAF check to inspect. Envoy keeps this request's stream open (no
+/// end_of_stream) in anticipation of the tunnel; without this check that reads as an
+/// ordinary large/streaming body, and the subsequent tunnelled bytes (audio, control
+/// frames, indefinitely, for the life of the connection) get buffered and shipped to
+/// AppSec as if they were more of the GET's body.
+fn is_protocol_upgrade(connection: &str, upgrade: &str) -> bool {
+    if upgrade.trim().is_empty() {
+        return false;
+    }
+    connection
+        .split(',')
+        .any(|tok| tok.trim().eq_ignore_ascii_case("upgrade"))
+}
+
 /// Snapshot the client's headers for later relay to AppSec, dropping the ones that must
 /// not cross the boundary and stopping once the byte budget is spent.
 fn collect_client_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
@@ -1082,7 +1101,19 @@ impl HttpContext for CrowdSecHttpContext {
             .get_http_request_header("content-length")
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
-        self.has_body = !end_of_stream || content_length > 0;
+        let connection_header = self
+            .get_http_request_header("connection")
+            .unwrap_or_default();
+        let upgrade_header = self.get_http_request_header("upgrade").unwrap_or_default();
+        if is_protocol_upgrade(&connection_header, &upgrade_header) {
+            log::info!(
+                "Protocol upgrade request (Upgrade: {}), skipping AppSec body inspection",
+                upgrade_header
+            );
+            self.has_body = false;
+        } else {
+            self.has_body = !end_of_stream || content_length > 0;
+        }
 
         if self.request_has_body() {
             if !end_of_stream {
@@ -1577,6 +1608,24 @@ mod tests {
         let out = collect_client_headers(headers);
         // The oversized header alone exhausts the budget; nothing after it is relayed
         assert_eq!(out.len(), 0);
+    }
+
+    #[test]
+    fn test_is_protocol_upgrade_detects_websocket_handshake() {
+        assert!(is_protocol_upgrade("Upgrade", "websocket"));
+        // Connection is a comma-separated token list, not just "Upgrade" alone
+        assert!(is_protocol_upgrade("keep-alive, Upgrade", "websocket"));
+        // Case-insensitive on both the token and the header value
+        assert!(is_protocol_upgrade("UPGRADE", "WebSocket"));
+    }
+
+    #[test]
+    fn test_is_protocol_upgrade_requires_both_signals() {
+        // Connection without the "upgrade" token: an ordinary keep-alive request
+        assert!(!is_protocol_upgrade("keep-alive", "websocket"));
+        // Upgrade token present but no protocol named to upgrade to
+        assert!(!is_protocol_upgrade("Upgrade", ""));
+        assert!(!is_protocol_upgrade("", ""));
     }
 
     #[test]
