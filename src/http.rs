@@ -713,13 +713,16 @@ impl CrowdSecHttpContext {
         }
     }
 
-    fn send_appsec_event(&mut self) {
-        let body_len = self.body_data.len().to_string();
-        let relayed_ct = self.relayed_content_type();
-        let mut headers = vec![
+    fn appsec_request_headers(&self) -> Vec<(&str, &str)> {
+        let authority = if self.config.crowdsec.appsec.host.is_empty() {
+            self.host.as_str()
+        } else {
+            self.config.crowdsec.appsec.host.as_str()
+        };
+        vec![
             (":method", "POST"),
             (":path", "/"),
-            (":authority", self.host.as_str()),
+            (":authority", authority),
             ("X-Crowdsec-Appsec-Ip", self.ip.as_str()),
             ("X-Crowdsec-Appsec-Uri", self.path.as_str()),
             ("X-Crowdsec-Appsec-Host", self.host.as_str()),
@@ -729,8 +732,14 @@ impl CrowdSecHttpContext {
                 "X-Crowdsec-Appsec-Api-Key",
                 self.config.crowdsec.appsec.key.as_str(),
             ),
-            ("Content-Length", body_len.as_str()),
-        ];
+        ]
+    }
+
+    fn send_appsec_event(&mut self) {
+        let body_len = self.body_data.len().to_string();
+        let relayed_ct = self.relayed_content_type();
+        let mut headers = self.appsec_request_headers();
+        headers.push(("Content-Length", body_len.as_str()));
         // Relay the client's own headers so AppSec rules matching on Referer, Origin,
         // Cookie or any custom header can actually fire — forwarding only the metadata
         // leaves every header-based rule blind. collect_client_headers has already
@@ -1225,6 +1234,28 @@ impl HttpContext for CrowdSecHttpContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_appsec_destination_host_preserves_original_host() {
+        let config: Config = serde_json::from_slice(
+            br#"{"crowdsec":{"lapi":{"cluster":"lapi"},"appsec":{"key":"test-key"}}}"#,
+        )
+        .unwrap();
+        let mut context = CrowdSecHttpContext::new(config);
+        for original_host in ["", "site.example.com:8080"] {
+            context.host = original_host.to_string();
+            for host in ["", "appsec.example.com", "appsec.example.com:8443"] {
+                context.config.crowdsec.appsec.host = host.to_string();
+                let headers = context.appsec_request_headers();
+                assert!(headers.contains(&(
+                    ":authority",
+                    if host.is_empty() { original_host } else { host }
+                )));
+                assert!(headers.contains(&("X-Crowdsec-Appsec-Host", original_host)));
+                assert!(headers.contains(&("X-Crowdsec-Appsec-Api-Key", "test-key")));
+            }
+        }
+    }
 
     #[test]
     fn test_strip_port_ipv4_with_port() {

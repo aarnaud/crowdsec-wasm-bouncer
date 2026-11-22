@@ -119,12 +119,14 @@ Edit `config.json` or inline in `envoy.yaml`:
       "lapi": {
         "enabled": true,
         "cluster": "crowdsec_lapi",
+        "host": "",
         "sync_freq": 10
       },
       "appsec": {
         "enabled": true,
         "async_mode": false,
         "cluster": "crowdsec_appsec",
+        "host": "",
         "forward_body": true,
         "max_body_size_kb": 8
       },
@@ -132,6 +134,63 @@ Edit `config.json` or inline in `envoy.yaml`:
     }
 }
 ```
+
+### Outbound hosts and environment variables
+
+Set `crowdsec.lapi.host` and `crowdsec.appsec.host` when a reverse proxy requires a
+particular HTTP Host header (`:authority`). Use a hostname, optionally with a port,
+such as `lapi.example.com` or `appsec.example.com:8443`, without a URL scheme or path.
+The Envoy cluster still determines the destination address and port.
+
+| JSON field | Environment fallback | Default when both are unset or empty |
+|------------|----------------------|--------------------------------------|
+| `crowdsec.lapi.host` | `CROWDSEC_LAPI_HOST` | Empty authority |
+| `crowdsec.appsec.host` | `CROWDSEC_APPSEC_HOST` | Original client request's authority |
+
+A nonempty JSON value takes precedence over the environment variable, matching the
+existing `key` fields and their `CROWDSEC_LAPI_KEY` / `CROWDSEC_APPSEC_KEY` fallbacks.
+Environment variables are read when the filter configuration loads and must be exposed
+to the WASM VM; setting them only on the Envoy process is insufficient. For example:
+
+```yaml
+# Under the WASM filter's vm_config
+environment_variables:
+  host_env_keys:
+    - CROWDSEC_LAPI_KEY
+    - CROWDSEC_APPSEC_KEY
+    - CROWDSEC_LAPI_HOST
+    - CROWDSEC_APPSEC_HOST
+```
+
+The AppSec host setting changes the destination authority only.
+`X-Crowdsec-Appsec-Host` continues to contain the original client request's host so
+AppSec evaluates the correct site.
+
+For an HTTPS reverse proxy, also configure TLS on the corresponding Envoy cluster.
+The HTTP host fields do not configure TLS SNI. For example, a cluster connecting to
+`lapi.example.com` on port 443 can use:
+
+```yaml
+# Under the crowdsec_lapi cluster
+transport_socket:
+  name: envoy.transport_sockets.tls
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+    sni: lapi.example.com
+    common_tls_context:
+      validation_context:
+        trusted_ca:
+          filename: /etc/ssl/certs/ca-certificates.crt
+        match_typed_subject_alt_names:
+          - san_type: DNS
+            matcher:
+              exact: lapi.example.com
+```
+
+Set `crowdsec.lapi.host` (or `CROWDSEC_LAPI_HOST`) to `lapi.example.com` for HTTP
+routing, and use the CA bundle path available in your Envoy container. Configure the
+AppSec cluster similarly when it uses HTTPS. See Envoy's
+[upstream TLS configuration](https://www.envoyproxy.io/docs/envoy/latest/api-v3/extensions/transport_sockets/tls/v3/tls.proto).
 
 ## Deploy
 
@@ -201,17 +260,21 @@ spec:
         hostKeys:
           - CROWDSEC_LAPI_KEY
           - CROWDSEC_APPSEC_KEY
+          - CROWDSEC_LAPI_HOST
+          - CROWDSEC_APPSEC_HOST
       config:
         crowdsec:
           lapi:
             enabled: true
             cluster: crowdsec_lapi
             #key: "YOUR_KEY_IF_NOT_IN_ENV"
+            #host: "lapi.example.com" # Or CROWDSEC_LAPI_HOST
             sync_freq: 10
           appsec:
             enabled: true
             cluster: crowdsec_appsec
             #key: "YOUR_KEY_IF_NOT_IN_ENV"
+            #host: "appsec.example.com" # Or CROWDSEC_APPSEC_HOST
             async_mode: false
             fail_open: false
             forward_body: true

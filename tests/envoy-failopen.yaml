@@ -43,6 +43,8 @@ static_resources:
                               host_env_keys:
                                 - CROWDSEC_LAPI_KEY
                                 - CROWDSEC_APPSEC_KEY
+                                - CROWDSEC_LAPI_HOST
+                                - CROWDSEC_APPSEC_HOST
                           configuration:
                             "@type": "type.googleapis.com/google.protobuf.StringValue"
                             value: |
