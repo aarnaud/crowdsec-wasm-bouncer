@@ -1,10 +1,11 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
+
 use serde::Deserialize;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
-use crate::config::Config;
+use crate::config::{Config, LAPIConfig};
 use crate::http::CrowdSecHttpContext;
 use crate::http::{encode_range, split_expiry, with_expiry};
 use crate::http::{IP_DECISION_PREFIX, RANGES_V4_KEY, RANGES_V6_KEY};
@@ -53,6 +54,25 @@ const STARTUP_DONE_KEY: &str = "crowdsec_startup_done";
 /// Applied when a decision's duration is missing or unparseable. Dropping the decision
 /// would fail open, and treating it as permanent is the bug this replaces, so bound it.
 const DEFAULT_DECISION_TTL_MS: i64 = 3_600_000;
+
+fn lapi_request_headers(config: &LAPIConfig, startup: bool) -> Vec<(&str, &str)> {
+    let path = if startup {
+        "/v1/decisions/stream?startup=true"
+    } else {
+        "/v1/decisions/stream"
+    };
+
+    vec![
+        (":method", "GET"),
+        (":path", path),
+        (":authority", config.host.as_str()),
+        ("X-Api-Key", config.key.as_str()),
+        (
+            "user-agent",
+            concat!("crowdsec-wasm-bouncer/v", env!("CARGO_PKG_VERSION")),
+        ),
+    ]
+}
 
 /// Parse a Go duration into milliseconds, as sent in a decision's `duration` field
 /// ("3h59m57s", "29m57s", "1m30.5s", or negative like "-52m11s" once elapsed).
@@ -185,22 +205,7 @@ impl CrowdSecPlugin {
 
         log::info!("Lock acquired, starting sync (startup={})", startup);
 
-        let path = if startup {
-            "/v1/decisions/stream?startup=true"
-        } else {
-            "/v1/decisions/stream"
-        };
-
-        let headers = vec![
-            (":method", "GET"),
-            (":path", path),
-            (":authority", ""),
-            ("X-Api-Key", &config.crowdsec.lapi.key),
-            (
-                "user-agent",
-                concat!("crowdsec-wasm-bouncer/v", env!("CARGO_PKG_VERSION")),
-            ),
-        ];
+        let headers = lapi_request_headers(&config.crowdsec.lapi, startup);
 
         match self.dispatch_http_call(
             &config.crowdsec.lapi.cluster,
@@ -474,17 +479,7 @@ impl RootContext for CrowdSecPlugin {
             Some(config_bytes) => {
                 match serde_json::from_slice::<Config>(&config_bytes) {
                     Ok(mut config) => {
-                        // Fall back to environment variables for empty keys
-                        if config.crowdsec.lapi.key.is_empty() {
-                            if let Ok(key) = std::env::var("CROWDSEC_LAPI_KEY") {
-                                config.crowdsec.lapi.key = key;
-                            }
-                        }
-                        if config.crowdsec.appsec.key.is_empty() {
-                            if let Ok(key) = std::env::var("CROWDSEC_APPSEC_KEY") {
-                                config.crowdsec.appsec.key = key;
-                            }
-                        }
+                        config.apply_environment(|name| std::env::var(name).ok());
 
                         // Drop unusable trusted_ips entries rather than carrying them
                         // into the trust check: an empty or unparseable entry can match
@@ -605,6 +600,28 @@ impl RootContext for CrowdSecPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_lapi_request_authority() {
+        let mut config: LAPIConfig =
+            serde_json::from_slice(br#"{"cluster":"lapi","key":"test-key"}"#).unwrap();
+        for host in ["", "lapi.example.com", "lapi.example.com:8443"] {
+            config.host = host.to_string();
+            for startup in [true, false] {
+                let headers = lapi_request_headers(&config, startup);
+                assert!(headers.contains(&(":authority", host)));
+                assert!(headers.contains(&("X-Api-Key", "test-key")));
+                assert!(headers.contains(&(
+                    ":path",
+                    if startup {
+                        "/v1/decisions/stream?startup=true"
+                    } else {
+                        "/v1/decisions/stream"
+                    }
+                )));
+            }
+        }
+    }
 
     #[test]
     fn test_parse_go_duration_typical_lapi_values() {
