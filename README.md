@@ -90,8 +90,15 @@ time. Check the proxy log on startup if the filter does not come up.
 
 `Ip` and `Range` scoped `ban` decisions are enforced. Other scopes (`Country`, `AS`) and
 other decision types (including `captcha`) are synced-but-ignored rather than treated as
-hard blocks, and are logged when seen. Range decisions are capped at 4096 per address
-family.
+hard blocks, and are logged when seen. `lapi.max_range_decisions` caps stored range
+decisions independently for IPv4 and IPv6 and defaults to `4096`. Set it to a larger
+positive number to raise the cap, or `0` for unlimited ranges. Exact-IP decisions
+are unaffected, and `lapi.max_body_size_kb` still separately limits response size.
+
+At capacity, additional new ranges are logged and dropped; existing CIDRs can still
+have their TTL refreshed. Expired and deleted records free capacity. Lowering the
+limit does not evict existing valid bans. Range matching scans the stored ranges,
+so raising or disabling the cap increases memory use and lookup cost.
 
 ## Project Structure
 
@@ -119,7 +126,8 @@ Edit `config.json` or inline in `envoy.yaml`:
       "lapi": {
         "enabled": true,
         "cluster": "crowdsec_lapi",
-        "sync_freq": 10
+        "sync_freq": 10,
+        "max_range_decisions": 4096
       },
       "appsec": {
         "enabled": true,
