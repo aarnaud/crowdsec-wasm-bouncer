@@ -1,14 +1,15 @@
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
 use serde::Deserialize;
+use std::cell::RefCell;
+use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use crate::config::Config;
 use crate::http::CrowdSecHttpContext;
-use crate::http::{encode_range, split_expiry, with_expiry};
-use crate::http::{IP_DECISION_PREFIX, RANGES_V4_KEY, RANGES_V6_KEY};
-use crate::http::{RANGE_V4_RECORD, RANGE_V6_RECORD};
+use crate::network::*;
 
 #[derive(Deserialize)]
 struct DecisionsResponse {
@@ -34,7 +35,7 @@ struct Decision {
 
 /// Hard cap on the LAPI decisions-stream response body read per sync tick.
 /// Bounds memory against a slow/compromised/misrouted LAPI claiming a huge
-/// body_size, while staying well above realistic blocklist sizes.
+/// body_size; deployments with larger blocklists can raise the configured cap.
 const MAX_LAPI_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
 
 /// Cap on stored Range decisions per address family. Each one is scanned on every
@@ -49,6 +50,10 @@ const MAX_RANGE_DECISIONS: usize = 4096;
 /// 8-worker proxy does eight full syncs on every start. Only set once the sync actually
 /// succeeds, so a failed pull is retried instead of leaving the bouncer empty.
 const STARTUP_DONE_KEY: &str = "crowdsec_startup_done";
+
+// Exact-IP keys are otherwise not enumerable through the Proxy-Wasm ABI. Keeping
+// an index lets a recovery snapshot remove bans whose deletion delta was lost.
+const IP_INDEX_KEY: &str = "crowdsec_ip_index_v1";
 
 /// Applied when a decision's duration is missing or unparseable. Dropping the decision
 /// would fail open, and treating it as permanent is the bug this replaces, so bound it.
@@ -121,23 +126,47 @@ pub struct CrowdSecPlugin {
     config: Option<Config>,
     /// Whether the sync currently in flight from this VM is the startup pull
     pending_startup: bool,
+    context_id: u32,
+    network: bool,
+    registry: Registry,
+    generation: u64,
+    pending_token: Option<u32>,
+    pending_since: u64,
 }
 
 impl CrowdSecPlugin {
-    pub fn new() -> Self {
+    pub fn new(context_id: u32) -> Self {
         Self {
             config: None,
             pending_startup: false,
+            context_id,
+            network: false,
+            registry: Rc::new(RefCell::new(HashMap::new())),
+            generation: 0,
+            pending_token: None,
+            pending_since: 0,
         }
     }
 
     fn sync_decisions(&mut self) {
         let config = match &self.config {
-            Some(c) => c,
+            Some(c) => c.clone(),
             None => return,
         };
 
         if !config.crowdsec.lapi.enabled {
+            return;
+        }
+
+        let now = now_millis(self);
+        if self.pending_token.is_some() {
+            if now.saturating_sub(self.pending_since) < 60_000 {
+                return;
+            }
+            self.finish_sync(false);
+        }
+        let frequency = self.config.as_ref().unwrap().crowdsec.lapi.sync_freq as u64 * 1000;
+        if !self.sync_due(now, frequency) {
             return;
         }
 
@@ -177,6 +206,17 @@ impl CrowdSecPlugin {
             return;
         }
 
+        if !self.sync_due(now, frequency) {
+            let _ = self.set_shared_data(sync_lock_key, None, None);
+            return;
+        }
+        let _ = self.set_shared_data(
+            "crowdsec_last_sync_attempt_v1",
+            Some(&now.to_be_bytes()),
+            None,
+        );
+        self.pending_since = now;
+
         // Decided here, under the lock, from shared state rather than a per-VM field, so
         // only one worker's VM performs the full pull
         let (startup_flag, _) = self.get_shared_data(STARTUP_DONE_KEY);
@@ -209,17 +249,95 @@ impl CrowdSecPlugin {
             vec![],
             Duration::from_secs(60),
         ) {
-            Ok(_) => {}
+            Ok(token) => self.pending_token = Some(token),
             Err(e) => {
                 log::error!("failed to dispatch LAPI call: {:?}", e);
-                // Release lock on error
-                let _ = self.set_shared_data(sync_lock_key, None, None);
+                self.finish_sync(false);
             }
         }
     }
 
-    /// Apply additions and removals to a packed range blob in shared data. Records are
-    /// fixed-width, so add/remove is a byte-slice comparison with no parsing.
+    fn sync_due(&self, now: u64, frequency: u64) -> bool {
+        let (last, _) = self.get_shared_data("crowdsec_last_sync_attempt_v1");
+        last.as_deref()
+            .and_then(parse_lock_timestamp)
+            .is_none_or(|last| now.saturating_sub(last) >= frequency)
+    }
+
+    fn finish_sync(&mut self, success: bool) {
+        // A late callback must not release another worker's stolen lease
+        let (lease, _) = self.get_shared_data("crowdsec_sync_lock");
+        if lease.as_deref().and_then(parse_lock_timestamp) == Some(self.pending_since) {
+            // A failed incremental response may already have advanced LAPI's stream.
+            // Recover with a full snapshot so missed additions cannot be lost forever.
+            if !success {
+                let _ = self.set_shared_data(STARTUP_DONE_KEY, None, None);
+            }
+            let _ = self.set_shared_data(HEALTH_KEY, Some(&[u8::from(success)]), None);
+            if success {
+                let (value, cas) = self.get_shared_data(GENERATION_KEY);
+                let next = value
+                    .as_deref()
+                    .and_then(parse_lock_timestamp)
+                    .unwrap_or(0)
+                    .wrapping_add(1);
+                if self
+                    .set_shared_data(GENERATION_KEY, Some(&next.to_be_bytes()), cas)
+                    .is_err()
+                {
+                    let _ = self.set_shared_data(HEALTH_KEY, Some(&[0]), None);
+                }
+            }
+            let _ = self.set_shared_data("crowdsec_sync_lock", None, None);
+        }
+        self.pending_token = None;
+    }
+
+    fn recheck_connections(&mut self) {
+        if !self
+            .config
+            .as_ref()
+            .is_some_and(|config| config.crowdsec.lapi.enabled)
+        {
+            return;
+        }
+        let (value, _) = self.get_shared_data(GENERATION_KEY);
+        let generation = value.as_deref().and_then(parse_lock_timestamp).unwrap_or(0);
+        if generation == self.generation {
+            return;
+        }
+        self.generation = generation;
+        // Closing can destroy contexts; never keep the registry borrowed across a host call
+        let contexts: Vec<_> = self
+            .registry
+            .borrow()
+            .iter()
+            .map(|(&id, entry)| (id, entry.clone()))
+            .collect();
+        for (id, entry) in contexts {
+            if cached_ban(self, &entry.ip).is_none() {
+                continue;
+            }
+            if proxy_wasm::hostcalls::set_effective_context(id).is_ok() {
+                log::warn!(
+                    "Closing newly banned {:?} context {} from {}",
+                    entry.kind,
+                    id,
+                    entry.ip
+                );
+                let result = match entry.kind {
+                    ContextKind::Network => proxy_wasm::hostcalls::close_downstream(),
+                    ContextKind::Http => proxy_wasm::hostcalls::reset_http_request(),
+                };
+                if let Err(error) = result {
+                    log::error!("failed to close banned context {}: {:?}", id, error);
+                }
+            }
+            let _ = proxy_wasm::hostcalls::set_effective_context(self.context_id);
+            self.registry.borrow_mut().remove(&id);
+        }
+    }
+
     /// Apply additions and removals to a packed range blob in shared data.
     ///
     /// Records are fixed-width, so add/remove is a byte-slice comparison with no parsing.
@@ -234,16 +352,21 @@ impl CrowdSecPlugin {
         add: &[Vec<u8>],
         remove: &[Vec<u8>],
         now: u64,
-    ) {
-        if add.is_empty() && remove.is_empty() {
-            return;
+        reset: bool,
+    ) -> Result<(), ()> {
+        if !reset && add.is_empty() && remove.is_empty() {
+            return Ok(());
         }
         fn cidr_of(record: &[u8]) -> Option<&[u8]> {
             split_expiry(record).map(|(_, cidr)| cidr)
         }
 
         let (existing, cas) = self.get_shared_data(key);
-        let existing = existing.unwrap_or_default();
+        let existing = if reset {
+            Vec::new()
+        } else {
+            existing.unwrap_or_default()
+        };
         let mut records: Vec<&[u8]> = existing.chunks_exact(record_size).collect();
 
         let before = records.len();
@@ -271,7 +394,7 @@ impl CrowdSecPlugin {
                     MAX_RANGE_DECISIONS,
                     key
                 );
-                break;
+                return Err(());
             }
             records.push(record.as_slice());
         }
@@ -280,6 +403,7 @@ impl CrowdSecPlugin {
         let blob: Vec<u8> = records.concat();
         if self.set_shared_data(key, Some(&blob), cas).is_err() {
             log::error!("Failed to update range blob {} (CAS conflict)", key);
+            Err(())
         } else {
             log::info!(
                 "Range blob {} now holds {} entries ({} expired or removed)",
@@ -287,26 +411,17 @@ impl CrowdSecPlugin {
                 count,
                 dropped
             );
+            Ok(())
         }
     }
 }
 
-impl Context for CrowdSecPlugin {
-    fn on_http_call_response(
-        &mut self,
-        _token_id: u32,
-        _num_headers: usize,
-        body_size: usize,
-        _num_trailers: usize,
-    ) {
-        // Always release the sync lock when done
-        let release_result = self.set_shared_data("crowdsec_sync_lock", None, None);
-        if release_result.is_ok() {
-            log::info!("Released sync lock");
-        } else {
-            log::error!("Failed to release sync lock: {:?}", release_result);
+impl CrowdSecPlugin {
+    fn apply_sync_response(&mut self, num_headers: usize, body_size: usize) -> bool {
+        if num_headers == 0 {
+            log::error!("LAPI call failed without response headers; keeping cached decisions");
+            return false;
         }
-
         let status = self
             .get_http_call_response_header(":status")
             .unwrap_or_else(|| "503".to_string())
@@ -318,7 +433,7 @@ impl Context for CrowdSecPlugin {
                 "LAPI decision endpoint returned unexpected status: {}",
                 status
             );
-            return;
+            return false;
         }
 
         let max_body = self
@@ -331,12 +446,12 @@ impl Context for CrowdSecPlugin {
             // tick rather than leaving the bouncer permanently without decisions
             log::error!(
                 "LAPI decisions response body too large ({} bytes, max {}); no decisions \
-                 applied and IP blocking is inactive until this succeeds. Raise \
+                 applied; keeping cached decisions and applying lapi.fail_open. Raise \
                  lapi.max_body_size_kb if the VM has headroom, or reduce the blocklist",
                 body_size,
                 max_body
             );
-            return;
+            return false;
         }
 
         let body = if body_size > 0 {
@@ -349,7 +464,7 @@ impl Context for CrowdSecPlugin {
             Some(b) => b,
             None => {
                 log::error!("failed to get LAPI decisions response body");
-                return;
+                return false;
             }
         };
 
@@ -357,12 +472,34 @@ impl Context for CrowdSecPlugin {
             Ok(r) => r,
             Err(e) => {
                 log::error!("failed to parse LAPI decisions response: {:?}", e);
-                return;
+                return false;
             }
         };
 
         let new = resp.new.unwrap_or_default();
         let deleted = resp.deleted.unwrap_or_default();
+        let index_needed = self.pending_startup
+            || new
+                .iter()
+                .chain(&deleted)
+                .any(|d| d.scope.eq_ignore_ascii_case("ip"));
+        let old_ips: BTreeSet<String> = if index_needed {
+            let (data, _) = self.get_shared_data(IP_INDEX_KEY);
+            data.map(|data| {
+                String::from_utf8_lossy(&data)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+        } else {
+            BTreeSet::new()
+        };
+        let mut current_ips = if self.pending_startup {
+            BTreeSet::new()
+        } else {
+            old_ips.clone()
+        };
 
         let now = self
             .get_current_time()
@@ -375,6 +512,33 @@ impl Context for CrowdSecPlugin {
         let mut v4_remove = Vec::new();
         let mut v6_remove = Vec::new();
         let mut applied = 0;
+
+        // Apply removals first so a replacement ban for the same IP wins this batch.
+        for d in &deleted {
+            match d.scope.to_lowercase().as_str() {
+                "ip" => {
+                    let ip = match normalize_ip(&d.value) {
+                        Some(ip) => ip,
+                        None => {
+                            log::warn!("Skipping invalid decision IP {}", d.value);
+                            continue;
+                        }
+                    };
+                    let key = format!("{}{}", IP_DECISION_PREFIX, ip);
+                    current_ips.remove(&ip);
+                    if self.set_shared_data(&key, None, None).is_err() {
+                        log::error!("failed to remove LAPI decision");
+                        return false;
+                    }
+                }
+                "range" => match encode_range(&d.value) {
+                    Some((true, cidr)) => v6_remove.push(cidr),
+                    Some((false, cidr)) => v4_remove.push(cidr),
+                    None => {}
+                },
+                _ => {}
+            }
+        }
 
         for d in &new {
             // Only "ban" is enforceable here. A captcha decision has no challenge flow on
@@ -408,10 +572,21 @@ impl Context for CrowdSecPlugin {
 
             match d.scope.to_lowercase().as_str() {
                 "ip" => {
-                    let key = format!("{}{}", IP_DECISION_PREFIX, d.value);
+                    let ip = match normalize_ip(&d.value) {
+                        Some(ip) => ip,
+                        None => {
+                            log::warn!("Skipping invalid decision IP {}", d.value);
+                            continue;
+                        }
+                    };
+                    let key = format!("{}{}", IP_DECISION_PREFIX, ip);
                     let reason = format!("{}_{}", d.decision_type, d.scenario);
                     let value = with_expiry(expires_at, reason.as_bytes());
-                    let _ = self.set_shared_data(&key, Some(&value), None);
+                    if self.set_shared_data(&key, Some(&value), None).is_err() {
+                        log::error!("failed to store LAPI decision");
+                        return false;
+                    }
+                    current_ips.insert(ip);
                     applied += 1;
                 }
                 "range" => match encode_range(&d.value) {
@@ -434,27 +609,57 @@ impl Context for CrowdSecPlugin {
             }
         }
 
-        // Removals apply regardless of type: whatever the decision was, it is over.
-        for d in &deleted {
-            match d.scope.to_lowercase().as_str() {
-                "ip" => {
-                    let key = format!("{}{}", IP_DECISION_PREFIX, d.value);
-                    let _ = self.set_shared_data(&key, None, None);
+        if self
+            .update_range_blob(
+                RANGES_V4_KEY,
+                RANGE_V4_RECORD,
+                &v4_add,
+                &v4_remove,
+                now,
+                self.pending_startup,
+            )
+            .is_err()
+            || self
+                .update_range_blob(
+                    RANGES_V6_KEY,
+                    RANGE_V6_RECORD,
+                    &v6_add,
+                    &v6_remove,
+                    now,
+                    self.pending_startup,
+                )
+                .is_err()
+        {
+            return false;
+        }
+
+        if self.pending_startup {
+            for ip in old_ips.difference(&current_ips) {
+                if self
+                    .set_shared_data(&format!("{}{}", IP_DECISION_PREFIX, ip), None, None)
+                    .is_err()
+                {
+                    return false;
                 }
-                "range" => match encode_range(&d.value) {
-                    Some((true, cidr)) => v6_remove.push(cidr),
-                    Some((false, cidr)) => v4_remove.push(cidr),
-                    None => {}
-                },
-                _ => {}
+            }
+        }
+        if index_needed {
+            let index = current_ips.into_iter().collect::<Vec<_>>().join("\n");
+            if self
+                .set_shared_data(IP_INDEX_KEY, Some(index.as_bytes()), None)
+                .is_err()
+            {
+                return false;
             }
         }
 
-        self.update_range_blob(RANGES_V4_KEY, RANGE_V4_RECORD, &v4_add, &v4_remove, now);
-        self.update_range_blob(RANGES_V6_KEY, RANGE_V6_RECORD, &v6_add, &v6_remove, now);
-
         if self.pending_startup {
-            let _ = self.set_shared_data(STARTUP_DONE_KEY, Some(&[1u8][..]), None);
+            if self
+                .set_shared_data(STARTUP_DONE_KEY, Some(&[1u8][..]), None)
+                .is_err()
+            {
+                return false;
+            }
             self.pending_startup = false;
             log::info!("Startup decision pull complete; other workers will sync incrementally");
         }
@@ -465,11 +670,31 @@ impl Context for CrowdSecPlugin {
             applied,
             deleted.len()
         );
+        true
+    }
+}
+
+impl Context for CrowdSecPlugin {
+    fn on_http_call_response(&mut self, token: u32, headers: usize, body: usize, _trailers: usize) {
+        if self.pending_token != Some(token) {
+            return;
+        }
+        let (lease, _) = self.get_shared_data("crowdsec_sync_lock");
+        if lease.as_deref().and_then(parse_lock_timestamp) != Some(self.pending_since) {
+            self.pending_token = None;
+            return;
+        }
+        let success = self.apply_sync_response(headers, body);
+        self.finish_sync(success);
+        self.recheck_connections();
     }
 }
 
 impl RootContext for CrowdSecPlugin {
     fn on_configure(&mut self, _configuration_size: usize) -> bool {
+        self.network = self
+            .get_property(vec!["plugin_root_id"])
+            .is_some_and(|id| id == NETWORK_ROOT_ID.as_bytes());
         match self.get_plugin_configuration() {
             Some(config_bytes) => {
                 match serde_json::from_slice::<Config>(&config_bytes) {
@@ -522,7 +747,7 @@ impl RootContext for CrowdSecPlugin {
                                 return false;
                             }
                         }
-                        if config.crowdsec.appsec.enabled {
+                        if !self.network && config.crowdsec.appsec.enabled {
                             if config.crowdsec.appsec.cluster.is_empty() {
                                 log::error!("appsec.enabled is true but appsec.cluster is empty");
                                 return false;
@@ -547,8 +772,10 @@ impl RootContext for CrowdSecPlugin {
 
                         log::warn!(
                             "CrowdSec Plugin loading:\n\
+                            \tNetwork filter: {}\n\
                             \tLAPI cluster: {}\n\
                             \tLAPI enabled: {}\n\
+                            \tLAPI FailOpen: {}\n\
                             \tLAPI sync_freq: {}\n\
                             \tAppSec cluster: {}\n\
                             \tAppsec enabled: {}\n\
@@ -556,11 +783,13 @@ impl RootContext for CrowdSecPlugin {
                             \tAppsec ForwardBody: {}\n\
                             \tAppsec MaxBodySizeKB: {}\n\
                             \tTrustedIPs: {}\n",
+                            self.network,
                             config.crowdsec.lapi.cluster,
                             config.crowdsec.lapi.enabled,
+                            config.crowdsec.lapi.fail_open,
                             config.crowdsec.lapi.sync_freq,
                             config.crowdsec.appsec.cluster,
-                            config.crowdsec.appsec.enabled,
+                            !self.network && config.crowdsec.appsec.enabled,
                             config.crowdsec.appsec.fail_open,
                             config.crowdsec.appsec.forward_body,
                             config.crowdsec.appsec.max_body_size_kb,
@@ -568,8 +797,7 @@ impl RootContext for CrowdSecPlugin {
                         );
 
                         // Schedule periodic sync
-                        let sync_millis = (config.crowdsec.lapi.sync_freq as u64) * 1000;
-                        self.set_tick_period(Duration::from_millis(sync_millis));
+                        self.set_tick_period(Duration::from_secs(1));
 
                         self.config = Some(config);
                         true
@@ -588,23 +816,46 @@ impl RootContext for CrowdSecPlugin {
     }
 
     fn on_tick(&mut self) {
+        self.recheck_connections();
         self.sync_decisions();
     }
 
-    fn create_http_context(&self, _context_id: u32) -> Option<Box<dyn HttpContext>> {
+    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
         Some(Box::new(CrowdSecHttpContext::new(
             self.config.as_ref()?.clone(),
+            context_id,
+            self.registry.clone(),
+        )))
+    }
+
+    fn create_stream_context(&self, context_id: u32) -> Option<Box<dyn StreamContext>> {
+        Some(Box::new(CrowdSecNetworkContext::new(
+            self.config.as_ref()?.crowdsec.lapi.clone(),
+            context_id,
+            self.registry.clone(),
         )))
     }
 
     fn get_type(&self) -> Option<ContextType> {
-        Some(ContextType::HttpContext)
+        Some(if self.network {
+            ContextType::StreamContext
+        } else {
+            ContextType::HttpContext
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_context_selects_http_or_network_without_a_mode_field() {
+        let mut root = CrowdSecPlugin::new(1);
+        assert_eq!(root.get_type(), Some(ContextType::HttpContext));
+        root.network = true;
+        assert_eq!(root.get_type(), Some(ContextType::StreamContext));
+    }
 
     #[test]
     fn test_parse_go_duration_typical_lapi_values() {

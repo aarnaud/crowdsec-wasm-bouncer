@@ -8,6 +8,7 @@ pub struct Config {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CrowdSecConfig {
     pub lapi: LAPIConfig,
+    #[serde(default)]
     pub appsec: AppSecConfig,
     // IPs/CIDRs (IPv4 or IPv6 exact) of trusted reverse proxies.
     // When the connecting address matches, the leftmost IP in X-Forwarded-For is used
@@ -18,6 +19,8 @@ pub struct CrowdSecConfig {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LAPIConfig {
+    #[serde(default)]
+    pub fail_open: bool,
     pub cluster: String,
     #[serde(default)]
     pub key: String,
@@ -73,4 +76,55 @@ fn default_max_lapi_body_size_kb() -> u32 {
 
 fn default_max_response_body_size_kb() -> u32 {
     1024
+}
+
+impl Default for AppSecConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            async_mode: false,
+            cluster: String::new(),
+            key: String::new(),
+            fail_open: false,
+            forward_body: false,
+            max_body_size_kb: default_max_body_size_kb(),
+            max_response_body_size_kb: default_max_response_body_size_kb(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_config_needs_no_appsec_section_or_mode() {
+        let config: Config =
+            serde_json::from_str(r#"{"crowdsec":{"lapi":{"cluster":"lapi"}}}"#).unwrap();
+        assert!(config.crowdsec.lapi.enabled);
+        assert!(!config.crowdsec.lapi.fail_open);
+        assert!(!config.crowdsec.appsec.enabled);
+        let explicit: AppSecConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            explicit.max_body_size_kb,
+            config.crowdsec.appsec.max_body_size_kb
+        );
+        assert_eq!(
+            explicit.max_response_body_size_kb,
+            config.crowdsec.appsec.max_response_body_size_kb
+        );
+    }
+
+    #[test]
+    fn failure_policies_are_independent() {
+        for lapi_open in [false, true] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "crowdsec": {"lapi": {"cluster": "lapi", "fail_open": lapi_open},
+                    "appsec": {"fail_open": !lapi_open}}
+            }))
+            .unwrap();
+            assert_eq!(config.crowdsec.lapi.fail_open, lapi_open);
+            assert_eq!(config.crowdsec.appsec.fail_open, !lapi_open);
+        }
+    }
 }

@@ -8,7 +8,7 @@ install-deps:
 	rustup target add wasm32-wasip1
 
 # Build the WASM module
-crowdsec_wasm_bouncer.wasm: Cargo.toml src/lib.rs src/config.rs src/plugin.rs src/http.rs
+crowdsec_wasm_bouncer.wasm: Cargo.toml src/lib.rs src/config.rs src/plugin.rs src/http.rs src/network.rs
 	cargo build --target wasm32-wasip1 --release
 
 # Clean build artifacts
@@ -46,3 +46,7 @@ integration-test: crowdsec_wasm_bouncer.wasm docker-up
 	cd tests && docker compose restart envoy envoy-async envoy-failopen envoy-lapi envoy-slowappsec
 	@sleep 2
 	cd tests && bash run_tests.sh; ret=$$?; exit $$ret
+
+# Requires Python h2 and Docker or Podman; all backends are isolated test fixtures
+network-integration-test: crowdsec_wasm_bouncer.wasm
+	python3 tests/network_integration.py
