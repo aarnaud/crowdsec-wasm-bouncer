@@ -103,6 +103,13 @@ family.
 
 ## Build
 
+Requires Rust 1.100 or newer. `rust-toolchain.toml` selects stable Rust with the
+`wasm32-wasip1` target, rustfmt, and Clippy. The Docker builder uses Rust 1.100.
+
+The WASI runtime provides `_initialize`; filter registration runs through a WASI
+constructor. This avoids the duplicate `_initialize` symbol produced by combining
+Rust 1.100's reactor startup with `proxy_wasm::main!`.
+
 ```
 make build
 # or
