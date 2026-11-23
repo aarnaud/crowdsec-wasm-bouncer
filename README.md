@@ -116,6 +116,13 @@ make build
 make docker-build
 ```
 
+## Connection-level LAPI enforcement
+
+The same binary can enforce LAPI decisions as an Envoy network filter for TCP/TLS
+connections, alongside the HTTP filter for AppSec, gRPC, and HTTP/3. See
+[network configuration and failure policies](docs/network-filter.md). LAPI now
+defaults to `fail_open: false`; set it explicitly where needed during migration.
+
 ## Configuration
 
 Edit `config.json` or inline in `envoy.yaml`:

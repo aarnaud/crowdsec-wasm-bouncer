@@ -52,6 +52,7 @@ static_resources:
                                 "crowdsec": {
                                   "lapi": {
                                     "enabled": true,
+                                    "fail_open": true,
                                     "cluster": "crowdsec_lapi",
                                     "sync_freq": 5
                                   },
