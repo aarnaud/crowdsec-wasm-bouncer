@@ -44,6 +44,19 @@ jobs:
       - name: Build WASM
         run: cargo build --target wasm32-wasip1 --release
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install network test dependency
+        run: python3 -m pip install h2
+
+      - name: Test listener coverage validation
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Test network and combined filters
+        run: python3 tests/network_integration.py
+
       - name: Start services
         run: make docker-up
 
