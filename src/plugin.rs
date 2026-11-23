@@ -37,7 +37,7 @@ struct Decision {
 /// body_size, while staying well above realistic blocklist sizes.
 const MAX_LAPI_RESPONSE_BODY_SIZE: usize = 32 * 1024 * 1024;
 
-/// Cap on stored Range decisions per address family. Each one is scanned on every
+/// Default cap on stored Range decisions per address family. Each one is scanned on every
 /// request, so this bounds both shared-data memory and the per-request match cost.
 const MAX_RANGE_DECISIONS: usize = 4096;
 
@@ -218,8 +218,6 @@ impl CrowdSecPlugin {
         }
     }
 
-    /// Apply additions and removals to a packed range blob in shared data. Records are
-    /// fixed-width, so add/remove is a byte-slice comparison with no parsing.
     /// Apply additions and removals to a packed range blob in shared data.
     ///
     /// Records are fixed-width, so add/remove is a byte-slice comparison with no parsing.
@@ -238,56 +236,97 @@ impl CrowdSecPlugin {
         if add.is_empty() && remove.is_empty() {
             return;
         }
-        fn cidr_of(record: &[u8]) -> Option<&[u8]> {
-            split_expiry(record).map(|(_, cidr)| cidr)
-        }
-
+        let limit = self
+            .config
+            .as_ref()
+            .map(|config| config.crowdsec.lapi.max_range_decisions as usize)
+            .unwrap_or(MAX_RANGE_DECISIONS);
         let (existing, cas) = self.get_shared_data(key);
-        let existing = existing.unwrap_or_default();
-        let mut records: Vec<&[u8]> = existing.chunks_exact(record_size).collect();
-
-        let before = records.len();
-        records.retain(|record| match split_expiry(record) {
-            Some((expires_at, cidr)) => {
-                expires_at > now && !remove.iter().any(|d| d.as_slice() == cidr)
-            }
-            None => false,
-        });
-        let dropped = before - records.len();
-
-        for record in add {
-            let cidr = match cidr_of(record) {
-                Some(c) => c,
-                None => continue,
-            };
-            if let Some(pos) = records.iter().position(|e| cidr_of(e) == Some(cidr)) {
-                // Same range, refreshed lifetime
-                records[pos] = record.as_slice();
-                continue;
-            }
-            if records.len() >= MAX_RANGE_DECISIONS {
-                log::error!(
-                    "Range decision cap ({}) reached for {}, dropping further ranges",
-                    MAX_RANGE_DECISIONS,
-                    key
-                );
-                break;
-            }
-            records.push(record.as_slice());
+        let update = merge_range_records(
+            existing.as_deref().unwrap_or_default(),
+            record_size,
+            add,
+            remove,
+            now,
+            limit,
+        );
+        if update.capped {
+            log::error!(
+                "Range decision cap ({}) reached for {}, dropping additional ranges; raise \
+                 lapi.max_range_decisions or set it to 0 for unlimited ranges",
+                limit,
+                key
+            );
         }
-
-        let count = records.len();
-        let blob: Vec<u8> = records.concat();
-        if self.set_shared_data(key, Some(&blob), cas).is_err() {
+        if self.set_shared_data(key, Some(&update.blob), cas).is_err() {
             log::error!("Failed to update range blob {} (CAS conflict)", key);
         } else {
             log::info!(
                 "Range blob {} now holds {} entries ({} expired or removed)",
                 key,
-                count,
-                dropped
+                update.count,
+                update.dropped
             );
         }
+    }
+}
+
+struct RangeUpdate {
+    blob: Vec<u8>,
+    count: usize,
+    dropped: usize,
+    capped: bool,
+}
+
+// Keep the in-memory merge independent of host calls so cap boundaries can be tested.
+fn merge_range_records(
+    existing: &[u8],
+    record_size: usize,
+    add: &[Vec<u8>],
+    remove: &[Vec<u8>],
+    now: u64,
+    limit: usize,
+) -> RangeUpdate {
+    fn cidr_of(record: &[u8]) -> Option<&[u8]> {
+        split_expiry(record).map(|(_, cidr)| cidr)
+    }
+
+    let mut records: Vec<&[u8]> = existing.chunks_exact(record_size).collect();
+
+    let before = records.len();
+    records.retain(|record| match split_expiry(record) {
+        Some((expires_at, cidr)) => {
+            expires_at > now && !remove.iter().any(|d| d.as_slice() == cidr)
+        }
+        None => false,
+    });
+    let dropped = before - records.len();
+
+    let mut capped = false;
+    for record in add {
+        let cidr = match cidr_of(record) {
+            Some(c) => c,
+            None => continue,
+        };
+        if let Some(pos) = records.iter().position(|e| cidr_of(e) == Some(cidr)) {
+            // Same range, refreshed lifetime
+            records[pos] = record.as_slice();
+            continue;
+        }
+        if limit != 0 && records.len() >= limit {
+            capped = true;
+            continue;
+        }
+        records.push(record.as_slice());
+    }
+
+    let count = records.len();
+    let blob: Vec<u8> = records.concat();
+    RangeUpdate {
+        blob,
+        count,
+        dropped,
+        capped,
     }
 }
 
@@ -605,6 +644,113 @@ impl RootContext for CrowdSecPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn range_record(ipv6: bool, index: u32, expires_at: u64) -> Vec<u8> {
+        let cidr = if ipv6 {
+            format!("2001:db8::{index:x}/128")
+        } else {
+            format!(
+                "10.{}.{}.{}/32",
+                index >> 16,
+                (index >> 8) & 255,
+                index & 255
+            )
+        };
+        let (_, encoded) = encode_range(&cidr).unwrap();
+        with_expiry(expires_at, &encoded)
+    }
+
+    #[test]
+    fn default_raised_and_unlimited_range_limits_cover_both_address_families() {
+        for ipv6 in [false, true] {
+            let width = if ipv6 {
+                RANGE_V6_RECORD
+            } else {
+                RANGE_V4_RECORD
+            };
+            let add: Vec<_> = (0..4097).map(|i| range_record(ipv6, i, 100)).collect();
+            for (limit, count, capped) in [
+                (MAX_RANGE_DECISIONS, 4096, true),
+                (8192, 4097, false),
+                (0, 4097, false),
+            ] {
+                let update = merge_range_records(&[], width, &add, &[], 1, limit);
+                assert_eq!(update.count, count);
+                assert_eq!(update.capped, capped);
+                assert_eq!(update.blob, add[..count].concat());
+            }
+        }
+    }
+
+    #[test]
+    fn range_limit_is_independent_for_each_family() {
+        for ipv6 in [false, true] {
+            let width = if ipv6 {
+                RANGE_V6_RECORD
+            } else {
+                RANGE_V4_RECORD
+            };
+            let add: Vec<_> = (0..3).map(|i| range_record(ipv6, i, 100)).collect();
+            let update = merge_range_records(&[], width, &add, &[], 1, 2);
+            assert_eq!(update.count, 2);
+            assert!(update.capped);
+            assert_eq!(update.blob, add[..2].concat());
+        }
+    }
+
+    #[test]
+    fn expiry_and_deletion_free_space_before_enforcing_the_range_cap() {
+        for ipv6 in [false, true] {
+            let width = if ipv6 {
+                RANGE_V6_RECORD
+            } else {
+                RANGE_V4_RECORD
+            };
+            let existing: Vec<_> = (0..3)
+                .map(|i| range_record(ipv6, i, if i == 0 { 10 } else { 100 }))
+                .collect();
+            let remove = vec![split_expiry(&existing[1]).unwrap().1.to_vec()];
+            let add = vec![range_record(ipv6, 3, 100)];
+            let update = merge_range_records(&existing.concat(), width, &add, &remove, 10, 2);
+            assert_eq!(update.dropped, 2);
+            assert!(!update.capped);
+            assert_eq!(update.blob, [existing[2].clone(), add[0].clone()].concat());
+        }
+    }
+
+    #[test]
+    fn refresh_at_capacity_is_not_lost_after_an_overflowing_addition() {
+        for ipv6 in [false, true] {
+            let width = if ipv6 {
+                RANGE_V6_RECORD
+            } else {
+                RANGE_V4_RECORD
+            };
+            let existing = [range_record(ipv6, 0, 100), range_record(ipv6, 1, 100)];
+            let add = vec![range_record(ipv6, 2, 200), range_record(ipv6, 0, 300)];
+            let update = merge_range_records(&existing.concat(), width, &add, &[], 1, 2);
+            assert!(update.capped);
+            assert_eq!(update.count, 2);
+            assert_eq!(update.blob, [add[1].clone(), existing[1].clone()].concat());
+        }
+    }
+
+    #[test]
+    fn lowering_the_range_limit_preserves_existing_valid_bans() {
+        for ipv6 in [false, true] {
+            let width = if ipv6 {
+                RANGE_V6_RECORD
+            } else {
+                RANGE_V4_RECORD
+            };
+            let existing: Vec<_> = (0..3).map(|i| range_record(ipv6, i, 100)).collect();
+            let add = vec![range_record(ipv6, 3, 100)];
+            let update = merge_range_records(&existing.concat(), width, &add, &[], 1, 1);
+            assert!(update.capped);
+            assert_eq!(update.count, 3);
+            assert_eq!(update.blob, existing.concat());
+        }
+    }
 
     #[test]
     fn test_parse_go_duration_typical_lapi_values() {

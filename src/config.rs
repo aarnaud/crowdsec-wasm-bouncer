@@ -30,6 +30,9 @@ pub struct LAPIConfig {
     // usage is roughly twice this. Raising it needs headroom in the WASM VM.
     #[serde(default = "default_max_lapi_body_size_kb")]
     pub max_body_size_kb: u32,
+    // Cap on stored Range decisions per address family; zero disables the cap.
+    #[serde(default = "default_max_range_decisions")]
+    pub max_range_decisions: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -71,6 +74,37 @@ fn default_max_lapi_body_size_kb() -> u32 {
     32 * 1024
 }
 
+fn default_max_range_decisions() -> u32 {
+    4096
+}
+
 fn default_max_response_body_size_kb() -> u32 {
     1024
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn range_limit_defaults_to_4096_per_family() {
+        let config: Config =
+            serde_json::from_slice(br#"{"crowdsec":{"lapi":{"cluster":"lapi"},"appsec":{}}}"#)
+                .unwrap();
+        assert_eq!(config.crowdsec.lapi.max_range_decisions, 4096);
+    }
+
+    #[test]
+    fn range_limit_accepts_custom_caps_and_zero_for_unlimited() {
+        for limit in [2, 8192, 0] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "crowdsec": {
+                    "lapi": {"cluster": "lapi", "max_range_decisions": limit},
+                    "appsec": {}
+                }
+            }))
+            .unwrap();
+            assert_eq!(config.crowdsec.lapi.max_range_decisions, limit);
+        }
+    }
 }
